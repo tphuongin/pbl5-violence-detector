@@ -1,10 +1,14 @@
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from database import engine, Base, SessionLocal, get_db, init_db
 from models import User, Camera, Call, ViolenceHistory
+from upload_service import upload_service
+from stream_service import get_stream_buffer, add_frame_to_stream, get_stream_info
 import os
 from dotenv import load_dotenv
+import tempfile
 
 # Load environment variables
 load_dotenv()
@@ -126,6 +130,132 @@ def get_calls(db: Session = Depends(get_db)):
             } for c in calls
         ]
     }
+
+# ============= UPLOAD ENDPOINTS =============
+@app.post("/api/upload/image")
+async def upload_image(file: UploadFile = File(...)):
+    """Upload image to Cloudinary"""
+    try:
+        # Save file temporarily
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp_file:
+            content = await file.read()
+            tmp_file.write(content)
+            tmp_file_path = tmp_file.name
+        
+        # Upload to Cloudinary
+        result = upload_service.upload_image(
+            tmp_file_path,
+            public_id=file.filename,
+            folder="images"
+        )
+        
+        # Clean up temp file
+        os.unlink(tmp_file_path)
+        
+        return result
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+@app.post("/api/upload/video")
+async def upload_video(file: UploadFile = File(...)):
+    """Upload video to Cloudinary"""
+    try:
+        # Save file temporarily
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_file:
+            content = await file.read()
+            tmp_file.write(content)
+            tmp_file_path = tmp_file.name
+        
+        # Upload to Cloudinary
+        result = upload_service.upload_video(
+            tmp_file_path,
+            public_id=file.filename,
+            folder="videos"
+        )
+        
+        # Clean up temp file
+        os.unlink(tmp_file_path)
+        
+        return result
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+@app.post("/api/upload/violence-clip")
+async def upload_violence_clip(
+    file: UploadFile = File(...),
+    location: str = "Unknown",
+    timestamp: str = None
+):
+    """Upload violence detection clip to Cloudinary"""
+    try:
+        # Save file temporarily
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_file:
+            content = await file.read()
+            tmp_file.write(content)
+            tmp_file_path = tmp_file.name
+        
+        # Upload to Cloudinary with organized naming
+        if not timestamp:
+            from datetime import datetime
+            timestamp = datetime.now().isoformat()
+        
+        result = upload_service.upload_detection_clip(
+            tmp_file_path,
+            location=location,
+            timestamp=timestamp
+        )
+        
+        # Clean up temp file
+        os.unlink(tmp_file_path)
+        
+        return result
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+@app.delete("/api/upload/{public_id}")
+def delete_file(public_id: str, resource_type: str = "image"):
+    """Delete file from Cloudinary"""
+    return upload_service.delete_file(public_id, resource_type)
+
+# ============= VIDEO STREAMING ENDPOINTS =============
+@app.post("/api/stream/{camera_id}/frame")
+async def receive_frame(camera_id: str, file: UploadFile = File(...)):
+    """Receive video frame from camera"""
+    try:
+        content = await file.read()
+        add_frame_to_stream(camera_id, content)
+        
+        return {
+            "success": True,
+            "message": f"Frame received for camera {camera_id}",
+            "camera_id": camera_id
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+@app.get("/api/stream/{camera_id}/live")
+async def stream_video(camera_id: str):
+    """Get MJPEG stream for camera"""
+    stream_buffer = get_stream_buffer(camera_id)
+    return StreamingResponse(
+        stream_buffer.get_mjpeg_stream(),
+        media_type="multipart/x-mixed-replace; boundary=frame"
+    )
+
+@app.get("/api/stream/{camera_id}/info")
+def get_camera_stream_info(camera_id: str):
+    """Get stream information for camera"""
+    return get_stream_info(camera_id)
+
+@app.post("/api/stream/{camera_id}/reset")
+def reset_stream(camera_id: str):
+    """Reset stream buffer for camera"""
+    stream_buffer = get_stream_buffer(camera_id)
+    stream_buffer.reset()
+    return {"success": True, "message": f"Stream for camera {camera_id} reset"}
 
 if __name__ == "__main__":
     import uvicorn

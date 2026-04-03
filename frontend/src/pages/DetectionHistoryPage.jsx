@@ -63,10 +63,10 @@ function DetectionHistoryPage() {
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                     <div>
                       <div style={{ fontWeight: 'bold', fontSize: '1.1em' }}>
-                        📍 {record.Location}
+                        {record.Location}
                       </div>
                       <div style={{ color: '#666', fontSize: '0.9em', marginTop: '5px' }}>
-                        ⏰ {new Date(record.Timestamp).toLocaleString('vi-VN')}
+                        {new Date(record.Timestamp).toLocaleString('vi-VN')}
                       </div>
                       <div style={{ marginTop: '10px' }}>
                         <span
