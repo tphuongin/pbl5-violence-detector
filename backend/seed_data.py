@@ -49,30 +49,30 @@ def seed_data():
         print("\n--- Seeding Cameras ---")
         cameras = [
             Camera(
-                CameraID=str(uuid.uuid4()),
+                CameraID="jetson-cam-01",
                 CameraName="Camera Main Hall",
-                CameraIP="192.168.1.10",
+                CameraIP="192.168.137.2",
                 CameraPhoneNum="0901234567",
                 CameraStatus=True
             ),
             Camera(
-                CameraID=str(uuid.uuid4()),
+                CameraID="jetson-cam-02",
                 CameraName="Camera Lobby",
-                CameraIP="192.168.1.11",
+                CameraIP="192.168.137.2",
                 CameraPhoneNum="0901234568",
                 CameraStatus=True
             ),
             Camera(
-                CameraID=str(uuid.uuid4()),
+                CameraID="jetson-cam-03",
                 CameraName="Camera Parking",
-                CameraIP="192.168.1.12",
+                CameraIP="192.168.137.2",
                 CameraPhoneNum="0901234569",
                 CameraStatus=False
             ),
             Camera(
-                CameraID=str(uuid.uuid4()),
+                CameraID="jetson-cam-04",
                 CameraName="Camera Entrance",
-                CameraIP="192.168.1.13",
+                CameraIP="192.168.137.2",
                 CameraPhoneNum="0901234570",
                 CameraStatus=True
             )

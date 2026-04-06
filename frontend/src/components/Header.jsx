@@ -26,7 +26,7 @@ function Header() {
     <header className="topbar">
       <div className="topbar-inner">
         <div className="brand" onClick={handleLogoClick} style={{ cursor: 'pointer' }}>
-          ABC
+          Violence Detector System
         </div>
 
         <div className="topbar-actions">

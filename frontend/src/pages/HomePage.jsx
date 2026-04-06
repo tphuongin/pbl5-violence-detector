@@ -33,6 +33,7 @@ function HomePage() {
       console.error('Error loading stats:', err);
     } finally {
       setLoading(false);
+      console.log("data", camerasData)
     }
   };
 

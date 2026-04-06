@@ -50,6 +50,9 @@ class StreamBuffer:
                         self.height = h
                         self.width = w
                         
+                logger.info(f"Frame added successfully for {self.camera_id}, frame_count: {self.frame_count}")
+            else:
+                logger.error(f"Failed to decode frame for {self.camera_id}")
         except Exception as e:
             logger.error(f"Error adding frame for camera {self.camera_id}: {e}")
     
@@ -68,6 +71,7 @@ class StreamBuffer:
     
     def get_mjpeg_stream(self):
         """Generator for MJPEG stream"""
+        import time
         try:
             while self.is_active:
                 with self.lock:
@@ -79,6 +83,7 @@ class StreamBuffer:
                                    b'Content-Type: image/jpeg\r\n'
                                    b'Content-Length: ' + str(len(jpeg)).encode() + b'\r\n\r\n' +
                                    jpeg.tobytes() + b'\r\n')
+                time.sleep(0.05)  # Yield latest frame every 0.05s
         except Exception as e:
             logger.error(f"Error in MJPEG stream for camera {self.camera_id}: {e}")
     
@@ -104,6 +109,7 @@ def get_stream_buffer(camera_id: str) -> StreamBuffer:
 
 def add_frame_to_stream(camera_id: str, frame_data: bytes):
     """Add frame to camera stream"""
+    logger.info(f"Adding frame to stream {camera_id}, size: {len(frame_data)}")
     buffer = get_stream_buffer(camera_id)
     buffer.add_frame(frame_data)
 

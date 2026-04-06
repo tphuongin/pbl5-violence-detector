@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, File, UploadFile
+from fastapi import FastAPI, Depends, HTTPException, File, UploadFile, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
@@ -7,7 +7,13 @@ from models import User, Camera, Call, ViolenceHistory
 from upload_service import upload_service
 from stream_service import get_stream_buffer, add_frame_to_stream, get_stream_info
 import os
+import cv2
+import asyncio
 from dotenv import load_dotenv
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 import tempfile
 
 # Load environment variables
@@ -225,12 +231,15 @@ async def receive_frame(camera_id: str, file: UploadFile = File(...)):
         content = await file.read()
         add_frame_to_stream(camera_id, content)
         
+        logger.info(f"Received frame for camera {camera_id}, size: {len(content)} bytes")
+        
         return {
             "success": True,
             "message": f"Frame received for camera {camera_id}",
             "camera_id": camera_id
         }
     except Exception as e:
+        logger.error(f"Error receiving frame for camera {camera_id}: {e}")
         return {
             "success": False,
             "error": str(e)
@@ -242,7 +251,8 @@ async def stream_video(camera_id: str):
     stream_buffer = get_stream_buffer(camera_id)
     return StreamingResponse(
         stream_buffer.get_mjpeg_stream(),
-        media_type="multipart/x-mixed-replace; boundary=frame"
+        media_type="multipart/x-mixed-replace; boundary=frame",
+        headers={"Cache-Control": "no-cache", "Pragma": "no-cache"}
     )
 
 @app.get("/api/stream/{camera_id}/info")
@@ -257,6 +267,44 @@ def reset_stream(camera_id: str):
     stream_buffer.reset()
     return {"success": True, "message": f"Stream for camera {camera_id} reset"}
 
+@app.websocket("/ws/stream/{camera_id}")
+async def websocket_stream(websocket: WebSocket, camera_id: str):
+    """WebSocket endpoint for receiving video frames from camera"""
+    await websocket.accept()
+    logger.info(f"WebSocket connection established for camera {camera_id}")
+    
+    try:
+        while True:
+            # Receive binary frame data
+            frame_data = await websocket.receive_bytes()
+            # Add frame to stream buffer
+            add_frame_to_stream(camera_id, frame_data)
+            logger.info(f"Received frame for camera {camera_id}, size: {len(frame_data)} bytes")
+    except Exception as e:
+        logger.error(f"WebSocket error for camera {camera_id}: {e}")
+    finally:
+        logger.info(f"WebSocket connection closed for camera {camera_id}")
+
+@app.websocket("/ws/view/{camera_id}")
+async def view_stream(websocket: WebSocket, camera_id: str):
+    """WebSocket endpoint for viewing video stream"""
+    await websocket.accept()
+    logger.info(f"WebSocket view connection established for camera {camera_id}")
+    
+    stream_buffer = get_stream_buffer(camera_id)
+    try:
+        while True:
+            if stream_buffer.frames:
+                frame = stream_buffer.frames[-1]
+                success, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                if success:
+                    await websocket.send_bytes(jpeg.tobytes())
+            await asyncio.sleep(0.05)
+    except Exception as e:
+        logger.error(f"WebSocket view error for camera {camera_id}: {e}")
+    finally:
+        logger.info(f"WebSocket view connection closed for camera {camera_id}")
+
 if __name__ == "__main__":
     import uvicorn
     
@@ -266,7 +314,7 @@ if __name__ == "__main__":
     print(f"\n🚀 Starting API on {api_host}:{api_port}")
     uvicorn.run(
         "main:app",
-        host=api_host,
+        host='0.0.0.0',
         port=api_port,
         reload=os.getenv('API_DEBUG', 'False') == 'True'
     )

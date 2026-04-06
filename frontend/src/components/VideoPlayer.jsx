@@ -4,54 +4,61 @@ function VideoPlayer({ cameraId, cameraName }) {
   const [isConnected, setIsConnected] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const imgRef = useRef(null);
-  const connectionTimeoutRef = useRef(null);
+  const wsRef = useRef(null);
+  const retryTimeoutRef = useRef(null);
 
   useEffect(() => {
     setIsLoading(true);
     setIsConnected(false);
 
-    // Start refreshing frames from MJPEG stream
-    const refreshFrame = () => {
-      if (imgRef.current) {
-        // Add timestamp to bypass cache
-        const timestamp = new Date().getTime();
-        imgRef.current.src = `http://localhost:8000/api/stream/${cameraId}/live?t=${timestamp}`;
-      }
+    const connectWebSocket = () => {
+      const wsUrl = `ws://192.168.137.1:8000/ws/view/${cameraId}`;
+      wsRef.current = new WebSocket(wsUrl);
+
+      wsRef.current.onopen = () => {
+        setIsConnected(true);
+        setIsLoading(false);
+        if (retryTimeoutRef.current) {
+          clearTimeout(retryTimeoutRef.current);
+        }
+      };
+
+      wsRef.current.onmessage = (event) => {
+        const arrayBuffer = event.data;
+        const blob = new Blob([arrayBuffer], { type: 'image/jpeg' });
+        const url = URL.createObjectURL(blob);
+        if (imgRef.current) {
+          imgRef.current.src = url;
+        }
+      };
+
+      wsRef.current.onclose = () => {
+        setIsConnected(false);
+        setIsLoading(false);
+        if (retryTimeoutRef.current) {
+          clearTimeout(retryTimeoutRef.current);
+        }
+        retryTimeoutRef.current = window.setTimeout(() => {
+          connectWebSocket();
+        }, 2000);
+      };
+
+      wsRef.current.onerror = (error) => {
+        console.error('WebSocket error:', error);
+        setIsConnected(false);
+        setIsLoading(false);
+      };
     };
 
-    // Initial frame load
-    refreshFrame();
-    setIsLoading(false);
-
-    // Set up connection timeout
-    connectionTimeoutRef.current = setTimeout(() => {
-      setIsConnected(false);
-    }, 5000);
-
-    const handleImageLoad = () => {
-      setIsConnected(true);
-      clearTimeout(connectionTimeoutRef.current);
-      // Refresh every 100ms for smooth playback
-      setTimeout(refreshFrame, 100);
-    };
-
-    const handleImageError = () => {
-      setIsConnected(false);
-      // Retry after 2 seconds
-      setTimeout(refreshFrame, 2000);
-    };
-
-    if (imgRef.current) {
-      imgRef.current.addEventListener('load', handleImageLoad);
-      imgRef.current.addEventListener('error', handleImageError);
-    }
+    connectWebSocket();
 
     return () => {
-      if (imgRef.current) {
-        imgRef.current.removeEventListener('load', handleImageLoad);
-        imgRef.current.removeEventListener('error', handleImageError);
+      if (wsRef.current) {
+        wsRef.current.close();
       }
-      clearTimeout(connectionTimeoutRef.current);
+      if (retryTimeoutRef.current) {
+        clearTimeout(retryTimeoutRef.current);
+      }
     };
   }, [cameraId]);
 
