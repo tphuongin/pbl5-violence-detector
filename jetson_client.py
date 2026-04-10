@@ -47,7 +47,7 @@ async def send_frames():
     while True:
         try:
             async with websockets.connect(BACKEND_WS_URL.format(CAMERA_ID=CAMERA_ID)) as websocket:
-                logger.info("✅ Kết nối WebSocket thành công")
+                logger.info("Kết nối WebSocket thành công")
 
                 while True:
                     start = time.time()

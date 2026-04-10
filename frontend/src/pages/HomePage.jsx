@@ -23,6 +23,8 @@ function HomePage() {
         apiService.getUsers(),
       ]);
 
+      console.log('Fetched data:', { camerasData, violenceData, callsData, usersData });
+
       setStats({
         cameras: camerasData.count || 0,
         violenceRecords: violenceData.count || 0,
@@ -33,7 +35,6 @@ function HomePage() {
       console.error('Error loading stats:', err);
     } finally {
       setLoading(false);
-      console.log("data", camerasData)
     }
   };
 
