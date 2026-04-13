@@ -1,4 +1,5 @@
-const API_BASE_URL = 'http://192.168.137.1:8000/api';
+const API_BASE_URL = 'http://localhost:8000/api';
+// const API_BASE_URL = 'http://192.168.137.1:8000/api'; 
 
 console.log('API Base URL:', API_BASE_URL);
 
@@ -26,6 +27,20 @@ export const apiService = {
       return await response.json();
     } catch (error) {
       console.error('Error fetching camera:', error);
+      return null;
+    }
+  },
+
+  getLatestDetection: async (cameraId) => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/detection/${cameraId}/latest`);
+      if (response.status === 404) {
+        return null;
+      }
+      if (!response.ok) throw new Error(`Failed to fetch detection: HTTP ${response.status}`);
+      return await response.json();
+    } catch (error) {
+      console.error('Error fetching latest detection:', error);
       return null;
     }
   },
