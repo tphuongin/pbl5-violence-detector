@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, File, UploadFile, WebSocket
+from fastapi import FastAPI, Depends, HTTPException, File, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
@@ -11,6 +11,7 @@ import cv2
 import asyncio
 from dotenv import load_dotenv
 import logging
+import json
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -28,6 +29,9 @@ app = FastAPI(
     description="API for violence detection system",
     version="1.0.0"
 )
+
+# Keep latest detection payload per camera in memory for quick access.
+latest_detections: dict = {}
 
 # Add CORS middleware
 app.add_middleware(
@@ -231,7 +235,7 @@ async def receive_frame(camera_id: str, file: UploadFile = File(...)):
         content = await file.read()
         add_frame_to_stream(camera_id, content)
         
-        logger.info(f"Received frame for camera {camera_id}, size: {len(content)} bytes")
+        # logger.info(f"Received frame for camera {camera_id}, size: {len(content)} bytes")
         
         return {
             "success": True,
@@ -279,7 +283,7 @@ async def websocket_stream(websocket: WebSocket, camera_id: str):
             frame_data = await websocket.receive_bytes()
             # Add frame to stream buffer
             add_frame_to_stream(camera_id, frame_data)
-            logger.info(f"Received frame for camera {camera_id}, size: {len(frame_data)} bytes")
+            # logger.info(f"Received frame for camera {camera_id}, size: {len(frame_data)} bytes")
     except Exception as e:
         logger.error(f"WebSocket error for camera {camera_id}: {e}")
     finally:
@@ -304,6 +308,43 @@ async def view_stream(websocket: WebSocket, camera_id: str):
         logger.error(f"WebSocket view error for camera {camera_id}: {e}")
     finally:
         logger.info(f"WebSocket view connection closed for camera {camera_id}")
+
+
+@app.websocket("/ws/detection/{camera_id}")
+async def websocket_detection(websocket: WebSocket, camera_id: str):
+    """WebSocket endpoint for receiving detection JSON payload from edge devices."""
+    await websocket.accept()
+    logger.info(f"WebSocket detection connection established for camera {camera_id}")
+
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                logger.warning(f"Invalid detection payload for camera {camera_id}")
+                continue
+
+            if isinstance(payload, dict):
+                payload.setdefault("camera_id", camera_id)
+                latest_detections[camera_id] = payload
+                # logger.info(
+                #     f"Detection received for camera {camera_id}: "
+                #     f"label={payload.get('label')} prob={payload.get('prob_smooth')}"
+                # )
+    except WebSocketDisconnect:
+        logger.info(f"WebSocket detection connection closed for camera {camera_id}")
+    except Exception as e:
+        logger.error(f"WebSocket detection error for camera {camera_id}: {e}")
+
+
+@app.get("/api/detection/{camera_id}/latest")
+def get_latest_detection(camera_id: str):
+    """Get latest detection payload for a camera."""
+    data = latest_detections.get(camera_id)
+    if not data:
+        raise HTTPException(status_code=404, detail="No detection data for this camera")
+    return data
 
 if __name__ == "__main__":
     import uvicorn

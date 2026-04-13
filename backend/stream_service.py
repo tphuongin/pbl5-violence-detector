@@ -50,7 +50,7 @@ class StreamBuffer:
                         self.height = h
                         self.width = w
                         
-                logger.info(f"Frame added successfully for {self.camera_id}, frame_count: {self.frame_count}")
+                # logger.info(f"Frame added successfully for {self.camera_id}, frame_count: {self.frame_count}")
             else:
                 logger.error(f"Failed to decode frame for {self.camera_id}")
         except Exception as e:
@@ -109,7 +109,7 @@ def get_stream_buffer(camera_id: str) -> StreamBuffer:
 
 def add_frame_to_stream(camera_id: str, frame_data: bytes):
     """Add frame to camera stream"""
-    logger.info(f"Adding frame to stream {camera_id}, size: {len(frame_data)}")
+    # logger.info(f"Adding frame to stream {camera_id}, size: {len(frame_data)}")
     buffer = get_stream_buffer(camera_id)
     buffer.add_frame(frame_data)
 
@@ -142,7 +142,7 @@ def cleanup_inactive_streams(timeout_seconds: int = 60):
             inactive.append(camera_id)
     
     for camera_id in inactive:
-        logger.info(f"Removing inactive stream for camera {camera_id}")
+        # logger.info(f"Removing inactive stream for camera {camera_id}")
         del active_streams[camera_id]
     
     return len(inactive)

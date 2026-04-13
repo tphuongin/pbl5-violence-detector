@@ -31,6 +31,20 @@ export const apiService = {
     }
   },
 
+  getLatestDetection: async (cameraId) => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/detection/${cameraId}/latest`);
+      if (response.status === 404) {
+        return null;
+      }
+      if (!response.ok) throw new Error(`Failed to fetch detection: HTTP ${response.status}`);
+      return await response.json();
+    } catch (error) {
+      console.error('Error fetching latest detection:', error);
+      return null;
+    }
+  },
+
   // Violence History
   getViolenceHistory: async () => {
     try {
