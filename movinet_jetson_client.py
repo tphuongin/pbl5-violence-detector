@@ -1,5 +1,5 @@
 """
-movinet_jetson_client_v2.py
+movinet_jetson_client_v4.py
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 Luồng hoạt động:
@@ -10,8 +10,8 @@ Luồng hoạt động:
                  │ frame_event.wait()
         ┌────────┴────────┐
         ▼                 ▼
-  VideoStreamer      InferenceWorker (thread)
-  (async task)         TensorRT MoViNet
+  stream_video        run_inference (thread)
+  (async task)          TensorRT MoViNet
         │                 │ lưu frame gốc + kết quả
         │ JPEG binary      │ vào SharedState
         ▼                 ▼
@@ -22,22 +22,35 @@ Luồng hoạt động:
                    BuzzerController (thread)
                    GPIO PIN 12 — kêu khi bạo lực ≥ 5s
 
-Thay đổi so với v1:
-  [1] Tách Inference ↔ Rendering:
-      - Inference chỉ lưu frame gốc numpy + (prob_raw, prob_smooth, label)
-        vào SharedState, KHÔNG gọi draw_overlay() hay cv2.imencode() bên trong
-      - Thumbnail encode (cv2.imencode) được thực hiện bởi
-        render_and_encode_thumb() được gọi từ stream_detection()
-        (luồng gửi kết quả) — tách hoàn toàn khỏi inference loop
-  [2] Event-based Sync thay Polling:
-      - frame_event = threading.Event() dùng chung giữa CameraCapture
-        và inference thread
-      - CameraCapture.run() gọi frame_event.set() sau mỗi frame mới
-      - run_inference() dùng frame_event.wait(timeout=0.1) ở đầu loop
-        thay vì time.sleep() ở cuối, rồi frame_event.clear() sau khi
-        lấy frame xong → không bỏ sót frame, không bận-chờ
+Thay đổi so với v3:
+  [v4] Auto binding mapping trong MoViNetTRT:
+      - Bỏ hoàn toàn STATE_MAP, LOGITS_NAME, IMAGE_NAME hard-code
+      - _auto_map_bindings() tự detect sau khi load engine dựa vào shape:
+          · Input  shape [1,1,H,W,3]      → IMAGE_NAME
+          · Output shape [1, num_classes]  → LOGITS_NAME
+          · Phần còn lại → state pairs, ghép input↔output bằng:
+              1. shape matching
+              2. suffix tên sau "block..." / "head..." để phân biệt
+                 khi nhiều tensor cùng shape
+      - Tương thích cả 2 version ONNX export:
+          · Bản cũ: prefix "call_state_..." / "call_image:0"
+          · Bản mới: prefix "serving_default_state_..." /
+                     "serving_default_image:0"
+      - Chỉ cần đổi ENGINE_PATH khi dùng engine mới
 
-JSON detection payload (gửi mỗi lần infer):
+Changelog đầy đủ (v1 → v4):
+  [v2-1] Tách Inference ↔ Rendering — encode JPEG/thumbnail
+         chỉ trong stream_detection(), không trong inference loop
+  [v2-2] Event-based sync thay polling — frame_event.wait/clear/set
+  [v3-1] Bỏ Sliding Window Reset — MoViNet Stream tự quản lý context
+  [v3-2] Fix race condition DetectionResult — _event tạo sẵn trong __init__
+  [v3-3] Fix snapshot() deep copy raw_frame
+  [v3-4] Fix thứ tự frame_event: clear → get_latest → wait
+  [v3-5] Fix stream_video block event loop — encode qua run_in_executor
+  [v3-6] Fix trt.Runtime lifetime — giữ làm instance variable
+  [v4]   Auto binding mapping — không còn hard-code tên binding
+
+JSON detection payload:
 {
   "camera_id":         "jetson-cam-01",
   "timestamp":         "14:35:22.047",
@@ -45,22 +58,26 @@ JSON detection payload (gửi mỗi lần infer):
   "prob_raw":          0.73,
   "prob_smooth":       0.61,
   "confirm_count":     2,
+  "confirm_needed":    2,
+  "threshold":         0.5,
   "infer_fps":         12.3,
   "cam_fps":           29.8,
   "uptime":            142,
-  "window_countdown":  1.3,
-  "violence_duration": 3.7,   // giây bạo lực liên tục (0 nếu Normal)
-  "buzzer_active":     false,  // còi đang kêu hay không
+  "infer_ms":          48.2,
+  "violence_duration": 3.7,
+  "buzzer_active":     false,
   "thumb_b64":         "<base64 jpeg 120x68>"
 }
 
-Chạy: python3 movinet_jetson_client_v2.py
+Chạy: python3 movinet_jetson_client_v4.py
 """
 
+import re
 import cv2
 import numpy as np
 import tensorrt as trt
 import pycuda.driver as cuda
+from collections import defaultdict, deque
 from typing import Optional
 import threading
 import asyncio
@@ -69,10 +86,9 @@ import time
 import base64
 import json
 import logging
-from collections import deque
 
 try:
-    import Jetson.GPIO as GPIO  # điều khiển các chân GPIO
+    import Jetson.GPIO as GPIO
     GPIO_AVAILABLE = True
 except ImportError:
     GPIO_AVAILABLE = False
@@ -98,18 +114,15 @@ CAMERA_HEIGHT     = 480
 CAMERA_FPS        = 30
 
 # ── Stream video ─────────────────────────────────────────
-STREAM_FPS        = 15      # FPS gửi lên backend
-JPEG_QUALITY      = 70      # mức nén ảnh
+STREAM_FPS        = 15
+JPEG_QUALITY      = 70
 
 # ── TensorRT model ───────────────────────────────────────
 ENGINE_PATH       = "movinet_stream.engine"
-INPUT_SIZE        = 172
+INPUT_SIZE        = 172      # dùng để validate IMAGE binding khi auto-map
 
 # ── Inference timing ─────────────────────────────────────
-INFER_INTERVAL_MS = 80      # ~12 lần/giây
-
-# ── Sliding window ───────────────────────────────────────
-WINDOW_SEC        = 2.0
+INFER_INTERVAL_MS = 80       # ~12 lần/giây
 
 # ── EMA smoothing ────────────────────────────────────────
 EMA_ALPHA         = 0.35
@@ -120,18 +133,18 @@ SPIKE_BOOST       = 1.35
 
 # ── Decision ─────────────────────────────────────────────
 THRESHOLD         = 0.50
-CONFIRM_FRAMES    = 2   # cần 2 lần liên tiếp mới xác nhận bạo lực
-COOLDOWN_SEC      = 0.8 # giữ trạng thái violence thêm 0.8s
+CONFIRM_FRAMES    = 2
+COOLDOWN_SEC      = 0.8
 
-# ── Thumbnail gửi kèm payload ────────────────────────────
+# ── Thumbnail ────────────────────────────────────────────
 THUMB_WIDTH       = 120
 THUMB_HEIGHT      = 68
 
 # ── Buzzer (GPIO) ─────────────────────────────────────────
-BUZZER_PIN              = 12    # Chân vật lý BOARD
-VIOLENCE_BUZZER_DELAY   = 5.0   # Giây bạo lực liên tục trước khi kêu còi
-BUZZER_BEEP_ON_SEC      = 0.5   # Thời gian còi kêu mỗi tiếng beep
-BUZZER_BEEP_OFF_SEC     = 0.3   # Khoảng nghỉ giữa các tiếng beep
+BUZZER_PIN              = 12
+VIOLENCE_BUZZER_DELAY   = 5.0
+BUZZER_BEEP_ON_SEC      = 0.5
+BUZZER_BEEP_OFF_SEC     = 0.3
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -142,59 +155,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger("jetson")
 
-# ── STATE_MAP (MoViNet A2 streaming states) ───────────────
-STATE_MAP = {
-    'call_state_block4_layer1_pool_frame_count:0': 'StatefulPartitionedCall:37',
-    'call_state_block1_layer1_stream_buffer:0':    'StatefulPartitionedCall:8',
-    'call_state_block1_layer2_stream_buffer:0':    'StatefulPartitionedCall:11',
-    'call_state_block3_layer1_pool_frame_count:0': 'StatefulPartitionedCall:25',
-    'call_state_block3_layer2_pool_buffer:0':      'StatefulPartitionedCall:27',
-    'call_state_block3_layer3_pool_frame_count:0': 'StatefulPartitionedCall:31',
-    'call_state_block4_layer0_pool_buffer:0':      'StatefulPartitionedCall:33',
-    'call_state_head_pool_frame_count:0':          'StatefulPartitionedCall:43',
-    'call_state_block3_layer0_stream_buffer:0':    'StatefulPartitionedCall:23',
-    'call_state_block2_layer2_stream_buffer:0':    'StatefulPartitionedCall:20',
-    'call_state_block2_layer1_pool_buffer:0':      'StatefulPartitionedCall:15',
-    'call_state_block2_layer1_stream_buffer:0':    'StatefulPartitionedCall:17',
-    'call_state_block3_layer1_stream_buffer:0':    'StatefulPartitionedCall:26',
-    'call_state_block4_layer0_pool_frame_count:0': 'StatefulPartitionedCall:34',
-    'call_state_block3_layer3_stream_buffer:0':    'StatefulPartitionedCall:32',
-    'call_state_block1_layer1_pool_buffer:0':      'StatefulPartitionedCall:6',
-    'call_state_block3_layer2_pool_frame_count:0': 'StatefulPartitionedCall:28',
-    'call_state_block0_layer0_pool_buffer:0':      'StatefulPartitionedCall:1',
-    'call_state_block0_layer0_pool_frame_count:0': 'StatefulPartitionedCall:2',
-    'call_state_block1_layer0_pool_frame_count:0': 'StatefulPartitionedCall:4',
-    'call_state_block3_layer0_pool_buffer:0':      'StatefulPartitionedCall:21',
-    'call_state_block2_layer2_pool_frame_count:0': 'StatefulPartitionedCall:19',
-    'call_state_block2_layer0_pool_frame_count:0': 'StatefulPartitionedCall:13',
-    'call_state_block4_layer2_pool_frame_count:0': 'StatefulPartitionedCall:39',
-    'call_state_block1_layer1_pool_frame_count:0': 'StatefulPartitionedCall:7',
-    'call_state_block3_layer2_stream_buffer:0':    'StatefulPartitionedCall:29',
-    'call_state_block4_layer0_stream_buffer:0':    'StatefulPartitionedCall:35',
-    'call_state_block1_layer0_stream_buffer:0':    'StatefulPartitionedCall:5',
-    'call_state_block3_layer1_pool_buffer:0':      'StatefulPartitionedCall:24',
-    'call_state_block4_layer3_pool_buffer:0':      'StatefulPartitionedCall:40',
-    'call_state_block1_layer0_pool_buffer:0':      'StatefulPartitionedCall:3',
-    'call_state_block3_layer0_pool_frame_count:0': 'StatefulPartitionedCall:22',
-    'call_state_block2_layer0_stream_buffer:0':    'StatefulPartitionedCall:14',
-    'call_state_block2_layer2_pool_buffer:0':      'StatefulPartitionedCall:18',
-    'call_state_head_pool_buffer:0':               'StatefulPartitionedCall:42',
-    'call_state_block4_layer1_pool_buffer:0':      'StatefulPartitionedCall:36',
-    'call_state_block1_layer2_pool_frame_count:0': 'StatefulPartitionedCall:10',
-    'call_state_block1_layer2_pool_buffer:0':      'StatefulPartitionedCall:9',
-    'call_state_block2_layer0_pool_buffer:0':      'StatefulPartitionedCall:12',
-    'call_state_block4_layer3_pool_frame_count:0': 'StatefulPartitionedCall:41',
-    'call_state_block4_layer2_pool_buffer:0':      'StatefulPartitionedCall:38',
-    'call_state_block3_layer3_pool_buffer:0':      'StatefulPartitionedCall:30',
-    'call_state_block2_layer1_pool_frame_count:0': 'StatefulPartitionedCall:16',
-}
-LOGITS_NAME = 'StatefulPartitionedCall:0'
-IMAGE_NAME  = 'call_image:0'
-TRT_LOGGER  = trt.Logger(trt.Logger.WARNING)
+TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  SHARED STATE  [THÊM MỚI]
+#  SHARED STATE
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class SharedState:
@@ -202,36 +167,24 @@ class SharedState:
     Thread-safe container lưu frame gốc numpy và kết quả inference
     mới nhất. Tách hoàn toàn khỏi việc encode JPEG/thumbnail.
 
-    Các trường được lưu:
-        raw_frame   : numpy array BGR gốc (chưa encode)
-        prob_raw    : xác suất bạo lực thô từ model
-        prob_smooth : xác suất sau EMA smoothing
-        label       : 'VIOLENCE' | 'Normal'
-
-    Cách dùng:
-        state = SharedState()
-        # Inference thread:
-        state.update(frame, prob_raw, prob_smooth, label)
-        # Rendering / stream_detection:
-        snap = state.snapshot()   # → dict hoặc None
+    update()   — gọi từ inference thread
+    snapshot() — gọi từ bất kỳ thread/coroutine nào,
+                 trả về deep copy của raw_frame để tránh race condition
     """
 
     def __init__(self):
-        self._lock       = threading.Lock()
-        self._raw_frame  = None
-        self._prob_raw   = 0.0
+        self._lock        = threading.Lock()
+        self._raw_frame   = None
+        self._prob_raw    = 0.0
         self._prob_smooth = 0.0
-        self._label      = 'Normal'
+        self._label       = 'Normal'
 
     def update(self,
                raw_frame: np.ndarray,
                prob_raw: float,
                prob_smooth: float,
                label: str) -> None:
-        """Ghi kết quả mới nhất (gọi từ inference thread)."""
         with self._lock:
-            # Lưu bản copy để tránh race condition khi caller tiếp tục
-            # dùng frame cho lần infer kế tiếp
             self._raw_frame   = raw_frame.copy()
             self._prob_raw    = prob_raw
             self._prob_smooth = prob_smooth
@@ -239,15 +192,15 @@ class SharedState:
 
     def snapshot(self) -> Optional[dict]:
         """
-        Trả về dict {'raw_frame', 'prob_raw', 'prob_smooth', 'label'}
-        hoặc None nếu chưa có dữ liệu.
-        Gọi từ bất kỳ thread/coroutine nào.
+        Trả về dict hoặc None nếu chưa có dữ liệu.
+        raw_frame là deep copy — caller tự do thao tác mà không
+        ảnh hưởng buffer nội bộ hay lần infer kế tiếp.
         """
         with self._lock:
             if self._raw_frame is None:
                 return None
             return {
-                'raw_frame':   self._raw_frame,   # numpy array, caller KHÔNG sửa
+                'raw_frame':   self._raw_frame.copy(),
                 'prob_raw':    self._prob_raw,
                 'prob_smooth': self._prob_smooth,
                 'label':       self._label,
@@ -256,16 +209,24 @@ class SharedState:
 
 def render_and_encode_thumb(raw_frame: np.ndarray) -> str:
     """
-    [THÊM MỚI] Tách khỏi inference loop.
-
-    Nhận frame gốc BGR numpy, thu nhỏ thành thumbnail và
-    trả về chuỗi base64 JPEG. Hàm này được gọi từ
-    stream_detection() — KHÔNG gọi từ run_inference().
+    Thu nhỏ frame thành thumbnail, trả về chuỗi base64 JPEG.
+    Gọi từ stream_detection() qua run_in_executor() —
+    KHÔNG gọi từ run_inference().
     """
     thumb = cv2.resize(raw_frame, (THUMB_WIDTH, THUMB_HEIGHT),
                        interpolation=cv2.INTER_LINEAR)
     _, buf = cv2.imencode('.jpg', thumb, [cv2.IMWRITE_JPEG_QUALITY, 70])
     return base64.b64encode(buf).decode('utf-8')
+
+
+def encode_frame_jpeg(frame: np.ndarray, quality: int = JPEG_QUALITY) -> bytes:
+    """
+    Encode frame thành JPEG bytes.
+    Chạy qua run_in_executor() trong stream_video() —
+    tránh block asyncio event loop.
+    """
+    _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    return buf.tobytes()
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -276,20 +237,17 @@ class BuzzerController(threading.Thread):
     """
     Thread quản lý còi GPIO độc lập.
 
-    Cách dùng:
-        buzzer = BuzzerController()
-        buzzer.start()
-        buzzer.activate()    # bắt đầu kêu (beep lặp lại)
-        buzzer.deactivate()  # tắt còi
-        buzzer.stop()        # dừng thread + cleanup GPIO
+    activate()   — bắt đầu beep lặp lại
+    deactivate() — tắt còi
+    stop()       — dừng thread + cleanup GPIO
     """
 
     def __init__(self):
         super().__init__(daemon=True, name="BuzzerThread")
-        self._active  = False
-        self._running = True
-        self._lock    = threading.Lock()
-        self._cond    = threading.Condition(self._lock)
+        self._active   = False
+        self._running  = True
+        self._lock     = threading.Lock()
+        self._cond     = threading.Condition(self._lock)
         self.available = GPIO_AVAILABLE
 
         if self.available:
@@ -300,10 +258,7 @@ class BuzzerController(threading.Thread):
         else:
             logger.warning("[Buzzer] Chạy ở chế độ giả lập (không có GPIO).")
 
-    # ── public API ───────────────────────────────────────
-
     def activate(self):
-        """Yêu cầu còi bắt đầu kêu (gọi được từ bất kỳ thread nào)."""
         with self._cond:
             if not self._active:
                 self._active = True
@@ -311,7 +266,6 @@ class BuzzerController(threading.Thread):
                 logger.warning("[Buzzer] ⚠  KÍCH HOẠT CÒI CẢNH BÁO!")
 
     def deactivate(self):
-        """Tắt còi (gọi được từ bất kỳ thread nào)."""
         with self._cond:
             if self._active:
                 self._active = False
@@ -319,7 +273,6 @@ class BuzzerController(threading.Thread):
                 logger.info("[Buzzer] Tắt còi.")
 
     def stop(self):
-        """Dừng thread và cleanup GPIO."""
         with self._cond:
             self._running = False
             self._active  = False
@@ -329,8 +282,6 @@ class BuzzerController(threading.Thread):
     def is_active(self):
         with self._lock:
             return self._active
-
-    # ── thread body ──────────────────────────────────────
 
     def run(self):
         try:
@@ -354,8 +305,6 @@ class BuzzerController(threading.Thread):
                 GPIO.cleanup()
                 logger.info("[Buzzer] GPIO cleanup xong.")
 
-    # ── helpers ──────────────────────────────────────────
-
     def _set_gpio(self, state: bool):
         if self.available:
             GPIO.output(BUZZER_PIN, GPIO.LOW if state else GPIO.HIGH)
@@ -364,7 +313,6 @@ class BuzzerController(threading.Thread):
                 logger.debug("[Buzzer][SIM] BEEP ON")
 
     def _interruptible_sleep(self, seconds: float):
-        """Ngủ nhưng có thể bị ngắt sớm khi trạng thái thay đổi."""
         deadline = time.time() + seconds
         while time.time() < deadline:
             with self._cond:
@@ -380,8 +328,7 @@ class BuzzerController(threading.Thread):
 
 class CameraCapture(threading.Thread):
     def __init__(self, frame_event: threading.Event):
-        super().__init__(daemon=True)
-        # [THÊM] Nhận frame_event từ ngoài để signal inference thread
+        super().__init__(daemon=True, name="CameraThread")
         self._frame_event = frame_event
         self._frame       = None
         self._lock        = threading.Lock()
@@ -390,7 +337,7 @@ class CameraCapture(threading.Thread):
         self.error_msg    = None
         self.camera_id    = None
 
-    def _try_open(self, idx):
+    def _try_open(self, idx: int):
         cap = cv2.VideoCapture(idx)
         if not cap.isOpened():
             cap.release()
@@ -417,28 +364,30 @@ class CameraCapture(threading.Thread):
             logger.error(f"[Camera] {self.error_msg}")
             return
 
-        cap.set(cv2.CAP_PROP_BUFFERSIZE,    1)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH,   CAMERA_WIDTH)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT,  CAMERA_HEIGHT)
-        cap.set(cv2.CAP_PROP_FPS,           CAMERA_FPS)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CAMERA_WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+        cap.set(cv2.CAP_PROP_FPS,          CAMERA_FPS)
         self.connected = True
-        logger.info(f"[Camera] OK — index={self.camera_id}  "
-                    f"{int(cap.get(3))}x{int(cap.get(4))}  {cap.get(5):.0f}fps")
+        logger.info(
+            f"[Camera] OK — index={self.camera_id}  "
+            f"{int(cap.get(3))}x{int(cap.get(4))}  {cap.get(5):.0f}fps"
+        )
 
         while self._running:
             if not cap.grab():
                 time.sleep(0.02)
                 continue
             ret, frame = cap.retrieve()
-            if ret:
+            if ret and frame is not None:
                 with self._lock:
                     self._frame = frame
-                # [THÊM] Thông báo cho inference thread có frame mới
                 self._frame_event.set()
 
         cap.release()
+        logger.info("[Camera] Đã đóng camera.")
 
-    def get_latest(self):
+    def get_latest(self) -> Optional[np.ndarray]:
         with self._lock:
             return self._frame.copy() if self._frame is not None else None
 
@@ -447,17 +396,47 @@ class CameraCapture(threading.Thread):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  TENSORRT MODEL
+#  TENSORRT MODEL  [v4: auto binding mapping]
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class MoViNetTRT:
-    def __init__(self, engine_path, cuda_ctx):
+    """
+    Wrapper TensorRT cho MoViNet-A2 Stream.
+
+    [v4] Auto binding mapping:
+      Không còn hard-code STATE_MAP / IMAGE_NAME / LOGITS_NAME.
+      _auto_map_bindings() tự detect toàn bộ sau khi load engine,
+      tương thích với mọi version ONNX export bất kể prefix tên.
+
+    Thuật toán mapping:
+      1. IMAGE input   : input duy nhất có ndim=5 và dim[-1]=3
+      2. LOGITS output : output duy nhất có ndim=2 và dim[-1] > 1
+      3. State pairs   : các input/output còn lại, ghép theo:
+           a. shape matching (grouping outputs theo shape)
+           b. suffix sau "block..." hoặc "head..." để phân biệt
+              chính xác khi nhiều tensor cùng shape
+              vd: "serving_default_state_block0_layer0_pool_buffer:0"
+                  → suffix = "block0_layer0_pool_buffer:0"
+
+    Không có sliding window reset:
+      MoViNet Stream buffer tự quản lý temporal context qua EMA
+      nội bộ — không tích lũy nhiễu theo thời gian.
+      reset_states() chỉ gọi khi camera reconnect thật sự.
+    """
+
+    def __init__(self, engine_path: str, cuda_ctx):
         self.cuda_ctx = cuda_ctx
         self.cuda_ctx.push()
-        with open(engine_path, 'rb') as f, trt.Runtime(TRT_LOGGER) as rt:
-            self.engine = rt.deserialize_cuda_engine(f.read())
+
+        # Giữ runtime sống cùng engine (tránh dangling reference)
+        self._runtime = trt.Runtime(TRT_LOGGER)
+        with open(engine_path, 'rb') as f:
+            self.engine = self._runtime.deserialize_cuda_engine(f.read())
+
         self.context = self.engine.create_execution_context()
-        self.hbuf, self.dbuf = {}, {}
+        self.hbuf    = {}
+        self.dbuf    = {}
+
         for i in range(self.engine.num_bindings):
             name  = self.engine.get_binding_name(i)
             shape = tuple(self.engine.get_binding_shape(i))
@@ -467,67 +446,238 @@ class MoViNetTRT:
             d = cuda.mem_alloc(h.nbytes)
             self.hbuf[name] = h
             self.dbuf[name] = d
+
+        # [v4] Auto-detect tất cả tên binding — không hard-code
+        self.IMAGE_NAME  = None
+        self.LOGITS_NAME = None
+        self.STATE_MAP   = {}   # input_name → output_name
+
+        self._auto_map_bindings()
         self.reset_states()
         self.cuda_ctx.pop()
-        logger.info(f"[TRT] Loaded — {self.engine.num_bindings} bindings")
+
+        logger.info(
+            f"[TRT] Loaded — {self.engine.num_bindings} bindings\n"
+            f"      IMAGE  : {self.IMAGE_NAME}\n"
+            f"      LOGITS : {self.LOGITS_NAME}\n"
+            f"      States : {len(self.STATE_MAP)} pairs"
+        )
+
+    # ── Auto mapping ──────────────────────────────────────
+
+    @staticmethod
+    def _state_suffix(name: str) -> str:
+        """
+        Trích phần định danh sau prefix export để dùng làm key match.
+
+        Ví dụ:
+          "serving_default_state_block0_layer0_pool_buffer:0"
+              → "block0_layer0_pool_buffer:0"
+          "call_state_block0_layer0_pool_buffer:0"
+              → "block0_layer0_pool_buffer:0"
+          "call_state_head_pool_buffer:0"
+              → "head_pool_buffer:0"
+        """
+        m = re.search(r'((?:block|head)\w+(?::\d+)?)', name)
+        return m.group(1) if m else name
+
+    def _auto_map_bindings(self):
+        """
+        Tự động xây dựng IMAGE_NAME, LOGITS_NAME, STATE_MAP
+        từ thông tin binding của engine — không phụ thuộc prefix tên.
+
+        Raises RuntimeError nếu không tìm được IMAGE hoặc LOGITS binding.
+        """
+        inputs  = {}   # name → shape  (binding is input)
+        outputs = {}   # name → shape  (binding is output)
+
+        for i in range(self.engine.num_bindings):
+            name  = self.engine.get_binding_name(i)
+            shape = tuple(self.engine.get_binding_shape(i))
+            if self.engine.binding_is_input(i):
+                inputs[name] = shape
+            else:
+                outputs[name] = shape
+
+        # ── 1. Detect IMAGE input ────────────────────────────────────────
+        # Shape [1, 1, H, W, 3] — ndim=5, last dim=3 (RGB channels)
+        for name, shape in inputs.items():
+            if len(shape) == 5 and shape[-1] == 3:
+                self.IMAGE_NAME = name
+                break
+
+        if self.IMAGE_NAME is None:
+            raise RuntimeError(
+                "[TRT] Auto-map thất bại: không tìm được IMAGE input "
+                "(cần shape [1,1,H,W,3]). Kiểm tra lại engine."
+            )
+
+        # Validate kích thước ảnh khớp với INPUT_SIZE đã config
+        img_h = inputs[self.IMAGE_NAME][2]
+        img_w = inputs[self.IMAGE_NAME][3]
+        if img_h != INPUT_SIZE or img_w != INPUT_SIZE:
+            logger.warning(
+                f"[TRT] IMAGE shape={inputs[self.IMAGE_NAME]} "
+                f"khác INPUT_SIZE={INPUT_SIZE} — "
+                f"sẽ resize về {img_h}x{img_w} thay vì {INPUT_SIZE}x{INPUT_SIZE}."
+            )
+            # Cập nhật INPUT_SIZE thực tế từ engine để infer() dùng đúng
+            self._infer_h = img_h
+            self._infer_w = img_w
+        else:
+            self._infer_h = INPUT_SIZE
+            self._infer_w = INPUT_SIZE
+
+        # ── 2. Detect LOGITS output ──────────────────────────────────────
+        # Shape [1, num_classes] — ndim=2, last dim > 1
+        for name, shape in outputs.items():
+            if len(shape) == 2 and shape[-1] > 1:
+                self.LOGITS_NAME = name
+                break
+
+        if self.LOGITS_NAME is None:
+            raise RuntimeError(
+                "[TRT] Auto-map thất bại: không tìm được LOGITS output "
+                "(cần shape [1, N] với N>1). Kiểm tra lại engine."
+            )
+
+        # ── 3. Build STATE_MAP: state inputs → state outputs ─────────────
+        state_inputs = {
+            name: shape
+            for name, shape in inputs.items()
+            if name != self.IMAGE_NAME
+        }
+        state_outputs = {
+            name: shape
+            for name, shape in outputs.items()
+            if name != self.LOGITS_NAME
+        }
+
+        if len(state_inputs) != len(state_outputs):
+            raise RuntimeError(
+                f"[TRT] Auto-map thất bại: số state input ({len(state_inputs)}) "
+                f"≠ state output ({len(state_outputs)}). Engine có vấn đề?"
+            )
+
+        # Group outputs theo shape để xử lý nhiều tensor cùng shape
+        output_by_shape = defaultdict(dict)   # shape → {suffix → name}
+        for name, shape in state_outputs.items():
+            suffix = self._state_suffix(name)
+            output_by_shape[shape][suffix] = name
+
+        used_outputs = set()
+        unmatched    = []
+
+        for in_name, in_shape in state_inputs.items():
+            in_suffix    = self._state_suffix(in_name)
+            candidates   = output_by_shape.get(in_shape, {})
+
+            # Ưu tiên 1: khớp suffix chính xác (block/head name giống nhau)
+            if in_suffix in candidates and candidates[in_suffix] not in used_outputs:
+                matched = candidates[in_suffix]
+
+            # Ưu tiên 2: lấy output cùng shape chưa được dùng
+            else:
+                fallback = [
+                    n for n in candidates.values()
+                    if n not in used_outputs
+                ]
+                if not fallback:
+                    unmatched.append(in_name)
+                    continue
+                matched = fallback[0]
+
+            self.STATE_MAP[in_name] = matched
+            used_outputs.add(matched)
+
+        if unmatched:
+            raise RuntimeError(
+                f"[TRT] Auto-map thất bại: không tìm được output state cho "
+                f"{len(unmatched)} input(s): {unmatched[:3]} …"
+            )
+
+        logger.info(f"[TRT] Auto-mapped {len(self.STATE_MAP)} state pairs.")
+
+    # ── Model operations ──────────────────────────────────
 
     def reset_states(self):
-        for name in STATE_MAP:
+        """
+        Zero toàn bộ stream state của MoViNet.
+        Chỉ gọi khi khởi tạo hoặc camera reconnect —
+        KHÔNG gọi định kỳ vì sẽ làm mất temporal context.
+        """
+        for name in self.STATE_MAP:
             self.hbuf[name].fill(0)
             cuda.memcpy_htod(self.dbuf[name], self.hbuf[name])
 
-    def infer(self, frame_bgr):
+    def infer(self, frame_bgr: np.ndarray):
+        """
+        Chạy inference 1 frame, trả về (prob_violence, prob_normal).
+        Stream state được cập nhật nội bộ sau mỗi lần infer.
+        """
         self.cuda_ctx.push()
         try:
             frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            frame = cv2.resize(frame, (INPUT_SIZE, INPUT_SIZE),
+            frame = cv2.resize(frame, (self._infer_w, self._infer_h),
                                interpolation=cv2.INTER_LINEAR)
             img = (frame.astype(np.float32) / 255.0).reshape(
-                1, 1, INPUT_SIZE, INPUT_SIZE, 3)
-            np.copyto(self.hbuf[IMAGE_NAME], img.ravel())
-            cuda.memcpy_htod(self.dbuf[IMAGE_NAME], self.hbuf[IMAGE_NAME])
-            for in_name in STATE_MAP:
+                1, 1, self._infer_h, self._infer_w, 3)
+
+            np.copyto(self.hbuf[self.IMAGE_NAME], img.ravel())
+            cuda.memcpy_htod(self.dbuf[self.IMAGE_NAME],
+                             self.hbuf[self.IMAGE_NAME])
+
+            for in_name in self.STATE_MAP:
                 cuda.memcpy_htod(self.dbuf[in_name], self.hbuf[in_name])
+
             bindings = [
                 int(self.dbuf[self.engine.get_binding_name(i)])
                 for i in range(self.engine.num_bindings)
             ]
             self.context.execute_v2(bindings)
-            cuda.memcpy_dtoh(self.hbuf[LOGITS_NAME], self.dbuf[LOGITS_NAME])
-            logits = self.hbuf[LOGITS_NAME].copy()
+
+            cuda.memcpy_dtoh(self.hbuf[self.LOGITS_NAME],
+                             self.dbuf[self.LOGITS_NAME])
+            logits = self.hbuf[self.LOGITS_NAME].copy()
             exp    = np.exp(logits - logits.max())
             probs  = exp / exp.sum()
-            for in_name, out_name in STATE_MAP.items():
+
+            # Cập nhật stream state cho frame tiếp theo
+            for in_name, out_name in self.STATE_MAP.items():
                 cuda.memcpy_dtoh(self.hbuf[in_name], self.dbuf[out_name])
+
             return float(probs[0]), float(probs[1])
         finally:
             self.cuda_ctx.pop()
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  DETECTION RESULT (async event bridge)
+#  DETECTION RESULT  (async event bridge)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class DetectionResult:
     """
-    Thread-safe container cho kết quả detection mới nhất.
-    asyncio.Event được tạo lazy để đảm bảo nằm trong đúng event loop.
+    Thread-safe bridge giữa inference thread (put) và
+    asyncio coroutine (get_new).
+
+    _event tạo sẵn trong __init__ để tránh race condition
+    khi put() được gọi trước get_new() lần đầu.
     """
-    def __init__(self, loop):
+
+    def __init__(self, loop: asyncio.AbstractEventLoop):
         self._lock  = threading.Lock()
         self._data  = None
         self._loop  = loop
-        self._event = None
+        self._event = asyncio.Event()   # tạo sẵn, không lazy
 
     def put(self, data: dict):
+        """Gọi từ inference thread."""
         with self._lock:
             self._data = data
-        if self._event is not None:
-            self._loop.call_soon_threadsafe(self._event.set)
+        self._loop.call_soon_threadsafe(self._event.set)
 
     async def get_new(self) -> dict:
-        if self._event is None:
-            self._event = asyncio.Event()
+        """Chờ result mới. Gọi từ asyncio coroutine."""
         await self._event.wait()
         self._event.clear()
         with self._lock:
@@ -535,7 +685,7 @@ class DetectionResult:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  INFERENCE THREAD  [CẬP NHẬT]
+#  INFERENCE THREAD
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def run_inference(cam: CameraCapture,
@@ -545,14 +695,18 @@ def run_inference(cam: CameraCapture,
                   buzzer: BuzzerController,
                   start_time: float):
     """
-    Inference loop — chỉ thực hiện:
-      1. Chờ frame mới qua frame_event (event-based, không polling)
+    Inference loop:
+      1. Chờ frame mới qua frame_event (event-based, không busy-poll)
       2. model.infer() → prob_raw, prob_smooth, label
-      3. shared_state.update(raw_frame, ...) — lưu frame gốc + kết quả
-      4. result_queue.put(payload) — KHÔNG encode thumbnail ở đây
+      3. shared_state.update() — lưu frame gốc numpy + kết quả
+      4. result_queue.put() — payload KHÔNG chứa thumbnail
 
-    Thumbnail encode (cv2.imencode) được thực hiện bởi
-    stream_detection() thông qua render_and_encode_thumb().
+    Thumbnail encode được thực hiện bởi stream_detection()
+    qua render_and_encode_thumb() + run_in_executor().
+
+    Không có sliding window reset:
+      MoViNet Stream buffer tự quản lý temporal context —
+      reset định kỳ làm mất context và gây warm-up lag ~1s.
     """
     cuda.init()
     cuda_ctx = cuda.Device(0).make_context()
@@ -561,9 +715,7 @@ def run_inference(cam: CameraCapture,
     model = MoViNetTRT(ENGINE_PATH, cuda_ctx)
 
     logger.info("[Inference] Chờ frame đầu tiên …")
-    # Chờ frame đầu tiên bằng event thay vì vòng lặp polling
-    got_first = frame_event.wait(timeout=30.0)
-    if not got_first:
+    if not frame_event.wait(timeout=30.0):
         logger.error("[Inference] Timeout: không nhận được frame sau 30s!")
         cuda_ctx.pop()
         cuda_ctx.detach()
@@ -571,51 +723,33 @@ def run_inference(cam: CameraCapture,
 
     logger.info("[Inference] Đã nhận frame — bắt đầu inference.")
 
-    prob_smooth        = 0.0
-    prev_prob_raw      = 0.0
-    confirm_count      = 0
-    violence_until     = 0.0
-    window_start       = time.time()
+    prob_smooth         = 0.0
+    prev_prob_raw       = 0.0
+    confirm_count       = 0
+    violence_until      = 0.0
     violence_start_time = None
 
-    cam_times   = deque(maxlen=60)
-    infer_times = deque(maxlen=30)
+    cam_times     = deque(maxlen=60)
+    infer_times   = deque(maxlen=30)
     last_infer_ms = 0.0
 
     try:
         while True:
-            # ── [THÊM] Event-based wait — không busy-poll ────────
-            # Chờ CameraCapture báo có frame mới (timeout để tránh
-            # treo mãi nếu camera ngắt kết nối)
-            frame_event.wait(timeout=0.1)
-            # Lấy frame và reset event ngay sau đó
+            # Thứ tự: clear → get_latest → (xử lý) → wait
+            # clear trước để không bỏ sót frame mới ghi sau get_latest
+            frame_event.clear()
             frame = cam.get_latest()
-            frame_event.clear()  # reset để chờ frame kế tiếp
 
             if frame is None:
+                frame_event.wait(timeout=0.1)
                 continue
 
             now    = time.time()
             now_ms = now * 1000
 
-            # ── Sliding window reset ──────────────────────────────
-            elapsed_window = now - window_start
-            if elapsed_window >= WINDOW_SEC:
-                model.cuda_ctx.push()
-                model.reset_states()
-                model.cuda_ctx.pop()
-                prob_smooth        = 0.0
-                prev_prob_raw      = 0.0
-                confirm_count      = 0
-                window_start       = now
-                elapsed_window     = 0.0
-                logger.info(f"[Window] Reset @ {time.strftime('%H:%M:%S')}")
-
-            countdown = WINDOW_SEC - elapsed_window
-
-            # ── Time-based inference throttle ────────────────────
+            # Throttle: bỏ qua frame nếu chưa đến interval tiếp theo
             if (now_ms - last_infer_ms) < INFER_INTERVAL_MS:
-                # Frame đến quá sớm — bỏ qua, chờ frame tiếp theo
+                frame_event.wait(timeout=0.1)
                 continue
 
             t0 = time.time()
@@ -624,16 +758,16 @@ def run_inference(cam: CameraCapture,
             last_infer_ms = now_ms
             infer_times.append(t1)
 
-            # EMA smoothing
+            # ── EMA smoothing ─────────────────────────────────────────────
             prob_smooth = EMA_ALPHA * prob_raw + (1.0 - EMA_ALPHA) * prob_smooth
 
-            # Spike boost
+            # ── Spike boost ───────────────────────────────────────────────
             delta = prob_raw - prev_prob_raw
             if delta > SPIKE_THRESH:
                 prob_smooth = min(1.0, prob_smooth * SPIKE_BOOST)
             prev_prob_raw = prob_raw
 
-            # Confirm + cooldown
+            # ── Confirm + cooldown ────────────────────────────────────────
             if prob_smooth >= THRESHOLD:
                 confirm_count += 1
             else:
@@ -644,67 +778,62 @@ def run_inference(cam: CameraCapture,
 
             label = 'VIOLENCE' if now < violence_until else 'Normal'
 
-            # ── [THÊM] Lưu frame gốc + kết quả vào SharedState ──
-            # Không encode JPEG ở đây — render_and_encode_thumb()
-            # sẽ được gọi từ stream_detection() khi cần gửi payload
+            # Lưu frame gốc numpy — KHÔNG encode JPEG ở đây
             shared_state.update(frame, prob_raw, prob_smooth, label)
 
-            # ── Buzzer logic ──────────────────────────────────────
+            # ── Buzzer logic ──────────────────────────────────────────────
             if label == 'VIOLENCE':
                 if violence_start_time is None:
                     violence_start_time = now
                     logger.info("[Buzzer] Bắt đầu theo dõi thời gian bạo lực …")
-
                 violence_duration = now - violence_start_time
-
                 if violence_duration >= VIOLENCE_BUZZER_DELAY:
                     buzzer.activate()
                 else:
-                    remaining_to_alarm = VIOLENCE_BUZZER_DELAY - violence_duration
                     logger.debug(
-                        f"[Buzzer] Bạo lực {violence_duration:.1f}s "
+                        f"[Buzzer] {violence_duration:.1f}s "
                         f"/ {VIOLENCE_BUZZER_DELAY}s "
-                        f"(còn {remaining_to_alarm:.1f}s nữa)"
+                        f"(còn {VIOLENCE_BUZZER_DELAY - violence_duration:.1f}s)"
                     )
             else:
                 if violence_start_time is not None:
-                    elapsed = now - violence_start_time
                     logger.info(
-                        f"[Buzzer] Kết thúc bạo lực sau {elapsed:.1f}s — reset."
+                        f"[Buzzer] Kết thúc bạo lực sau "
+                        f"{now - violence_start_time:.1f}s — reset."
                     )
                     violence_start_time = None
                 buzzer.deactivate()
                 violence_duration = 0.0
 
-            # FPS
-            infer_fps = (len(infer_times) - 1) / (infer_times[-1] - infer_times[0]) \
-                        if len(infer_times) > 1 else 0.0
+            # ── FPS ───────────────────────────────────────────────────────
+            infer_fps = (
+                (len(infer_times) - 1) / (infer_times[-1] - infer_times[0])
+                if len(infer_times) > 1 else 0.0
+            )
             cam_times.append(now)
-            cam_fps = (len(cam_times) - 1) / (cam_times[-1] - cam_times[0]) \
-                      if len(cam_times) > 1 else 0.0
+            cam_fps = (
+                (len(cam_times) - 1) / (cam_times[-1] - cam_times[0])
+                if len(cam_times) > 1 else 0.0
+            )
 
-            ts_str = time.strftime('%H:%M:%S') + f'.{int((now % 1)*1000):03d}'
+            ts_str = time.strftime('%H:%M:%S') + f'.{int((now % 1) * 1000):03d}'
 
-            # ── Payload KHÔNG chứa thumb_b64 ─────────────────────
-            # thumb_b64 sẽ được thêm bởi stream_detection() khi encode
+            # thumb_b64 được thêm bởi stream_detection()
             payload = {
                 "camera_id":         CAMERA_ID,
                 "timestamp":         ts_str,
                 "label":             label,
-                "prob_raw":          round(prob_raw,          4),
-                "prob_smooth":       round(prob_smooth,        4),
+                "prob_raw":          round(prob_raw,           4),
+                "prob_smooth":       round(prob_smooth,         4),
                 "confirm_count":     confirm_count,
                 "confirm_needed":    CONFIRM_FRAMES,
                 "threshold":         THRESHOLD,
-                "infer_fps":         round(infer_fps,         1),
-                "cam_fps":           round(cam_fps,           1),
+                "infer_fps":         round(infer_fps,          1),
+                "cam_fps":           round(cam_fps,            1),
                 "uptime":            int(now - start_time),
-                "window_countdown":  round(countdown,         2),
-                "window_sec":        WINDOW_SEC,
-                "infer_ms":          round((t1 - t0) * 1000,  1),
-                "violence_duration": round(violence_duration,  2),
+                "infer_ms":          round((t1 - t0) * 1000,   1),
+                "violence_duration": round(violence_duration,   2),
                 "buzzer_active":     buzzer.is_active,
-                # thumb_b64 được thêm sau bởi stream_detection()
             }
 
             result_queue.put(payload)
@@ -714,11 +843,10 @@ def run_inference(cam: CameraCapture,
                 f"confirm={confirm_count}/{CONFIRM_FRAMES}  → {label}  "
                 f"dur={violence_duration:.1f}s  "
                 f"buzzer={'ON' if buzzer.is_active else 'off'}  "
-                f"({(t1-t0)*1000:.0f}ms)"
+                f"({(t1 - t0) * 1000:.0f}ms)"
             )
 
-            # Không có time.sleep() ở đây — event-based wait ở đầu loop
-            # đảm nhiệm việc nhường CPU
+            frame_event.wait(timeout=0.1)
 
     except Exception as e:
         logger.exception(f"[Inference] Lỗi: {e}")
@@ -732,8 +860,12 @@ def run_inference(cam: CameraCapture,
 #  ASYNC TASK 1 — STREAM VIDEO
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-async def stream_video(cam: CameraCapture):
-    """Gửi JPEG frame liên tục lên ws://.../ws/stream/{CAMERA_ID}"""
+async def stream_video(cam: CameraCapture,
+                       loop: asyncio.AbstractEventLoop):
+    """
+    Gửi JPEG frame liên tục lên ws://.../ws/stream/{CAMERA_ID}.
+    cv2.imencode() chạy trong run_in_executor() — không block event loop.
+    """
     interval = 1.0 / STREAM_FPS
     while True:
         try:
@@ -743,38 +875,38 @@ async def stream_video(cam: CameraCapture):
                     t0    = time.time()
                     frame = cam.get_latest()
                     if frame is not None:
-                        _, buf = cv2.imencode(
-                            '.jpg', frame,
-                            [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
+                        jpeg_bytes = await loop.run_in_executor(
+                            None, encode_frame_jpeg, frame
                         )
-                        await ws.send(buf.tobytes())
-                    sleep_t = interval - (time.time() - t0)
-                    if sleep_t > 0:
-                        await asyncio.sleep(sleep_t)
-                    else:
-                        await asyncio.sleep(0)
+                        await ws.send(jpeg_bytes)
+                    await asyncio.sleep(max(0.0, interval - (time.time() - t0)))
 
         except websockets.exceptions.ConnectionClosed:
-            logger.warning(f"[Stream] Mất kết nối, thử lại sau {RECONNECT_DELAY}s …")
+            logger.warning(
+                f"[Stream] Mất kết nối, thử lại sau {RECONNECT_DELAY}s …"
+            )
         except Exception as e:
-            logger.error(f"[Stream] Lỗi: {e}, thử lại sau {RECONNECT_DELAY}s …")
+            logger.error(
+                f"[Stream] Lỗi: {e}, thử lại sau {RECONNECT_DELAY}s …"
+            )
         await asyncio.sleep(RECONNECT_DELAY)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  ASYNC TASK 2 — GỬI KẾT QUẢ DETECTION  [CẬP NHẬT]
+#  ASYNC TASK 2 — GỬI KẾT QUẢ DETECTION
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 async def stream_detection(result_queue: DetectionResult,
-                            shared_state: SharedState):
+                            shared_state: SharedState,
+                            loop: asyncio.AbstractEventLoop):
     """
     Gửi JSON detection result lên ws://.../ws/detection/{CAMERA_ID}.
 
-    [THÊM] Encode thumbnail tại đây (tách khỏi inference loop):
-      - Lấy payload từ result_queue (không có thumb_b64)
-      - Lấy frame gốc từ shared_state.snapshot()
-      - Gọi render_and_encode_thumb() để encode JPEG
-      - Thêm thumb_b64 vào payload rồi gửi đi
+    Encode thumbnail tại đây (tách khỏi inference loop):
+      1. Nhận payload từ result_queue (không có thumb_b64)
+      2. Lấy frame gốc từ shared_state.snapshot()
+      3. Gọi render_and_encode_thumb() qua run_in_executor()
+      4. Thêm thumb_b64 vào payload rồi gửi
     """
     while True:
         try:
@@ -783,11 +915,8 @@ async def stream_detection(result_queue: DetectionResult,
                 while True:
                     payload = await result_queue.get_new()
 
-                    # Encode thumbnail ở đây, KHÔNG trong inference thread
                     snap = shared_state.snapshot()
                     if snap is not None:
-                        # Chạy encode trong executor để không block event loop
-                        loop = asyncio.get_event_loop()
                         thumb_b64 = await loop.run_in_executor(
                             None,
                             render_and_encode_thumb,
@@ -800,9 +929,13 @@ async def stream_detection(result_queue: DetectionResult,
                     await ws.send(json.dumps(payload, ensure_ascii=False))
 
         except websockets.exceptions.ConnectionClosed:
-            logger.warning(f"[Detection] Mất kết nối, thử lại sau {RECONNECT_DELAY}s …")
+            logger.warning(
+                f"[Detection] Mất kết nối, thử lại sau {RECONNECT_DELAY}s …"
+            )
         except Exception as e:
-            logger.error(f"[Detection] Lỗi: {e}, thử lại sau {RECONNECT_DELAY}s …")
+            logger.error(
+                f"[Detection] Lỗi: {e}, thử lại sau {RECONNECT_DELAY}s …"
+            )
         await asyncio.sleep(RECONNECT_DELAY)
 
 
@@ -812,17 +945,15 @@ async def stream_detection(result_queue: DetectionResult,
 
 async def main():
     start_time = time.time()
+    loop       = asyncio.get_event_loop()   # Python 3.6 compatible
 
-    # ── Khởi động Buzzer ──────────────────────────────────
     buzzer = BuzzerController()
     buzzer.start()
 
-    # ── [THÊM] Tạo frame_event và shared_state ───────────
     frame_event  = threading.Event()
     shared_state = SharedState()
 
-    # ── Khởi động camera ─────────────────────────────────
-    cam = CameraCapture(frame_event)   # truyền frame_event vào camera
+    cam = CameraCapture(frame_event)
     cam.start()
     logger.info("[Main] Chờ camera kết nối …")
 
@@ -838,46 +969,47 @@ async def main():
 
     logger.info(f"[Main] Camera sẵn sàng — index={cam.camera_id}")
 
-    # ── Tạo DetectionResult ───────────────────────────────
-    loop = asyncio.get_event_loop()
     result_queue = DetectionResult(loop)
 
-    # ── Khởi động inference thread ────────────────────────
     infer_thread = threading.Thread(
         target=run_inference,
         args=(cam, frame_event, shared_state, result_queue, buzzer, start_time),
         daemon=True,
+        name="InferenceThread",
     )
     infer_thread.start()
-    logger.info("[Main] Inference thread đã khởi động")
+    logger.info("[Main] Inference thread đã khởi động.")
 
-    # ── In thông tin cấu hình ─────────────────────────────
-    print("=" * 60)
-    print("  Jetson Violence Detection Client  [v2]")
+    print("=" * 62)
+    print("  Jetson Violence Detection Client  [v4]")
     print(f"  Camera index       : {cam.camera_id}")
     print(f"  Stream URL         : {WS_STREAM_URL}")
     print(f"  Detection URL      : {WS_DETECTION_URL}")
     print(f"  Stream FPS         : {STREAM_FPS}")
-    print(f"  Infer rate         : mỗi {INFER_INTERVAL_MS}ms (~{1000//INFER_INTERVAL_MS}/s)")
-    print(f"  Window reset       : mỗi {WINDOW_SEC}s")
+    print(f"  Infer rate         : mỗi {INFER_INTERVAL_MS}ms (~{1000 // INFER_INTERVAL_MS}/s)")
+    print(f"  Binding mapping    : TỰ ĐỘNG — không hard-code tên")
+    print(f"  Sliding window     : TẮT — MoViNet Stream tự quản lý context")
     print(f"  EMA alpha          : {EMA_ALPHA}")
+    print(f"  Spike boost        : x{SPIKE_BOOST} khi delta > {SPIKE_THRESH}")
     print(f"  Threshold          : {THRESHOLD}  (áp lên smooth prob)")
     print(f"  Confirm            : {CONFIRM_FRAMES} lần liên tiếp")
     print(f"  Cooldown           : {COOLDOWN_SEC}s")
-    print(f"  ── Buzzer ─────────────────────────────────")
+    print(f"  ── Buzzer ──────────────────────────────────────")
     print(f"  GPIO PIN           : {BUZZER_PIN}  (BOARD)")
     print(f"  Kích hoạt sau      : {VIOLENCE_BUZZER_DELAY}s bạo lực liên tục")
     print(f"  Beep ON / OFF      : {BUZZER_BEEP_ON_SEC}s / {BUZZER_BEEP_OFF_SEC}s")
     print(f"  GPIO khả dụng      : {GPIO_AVAILABLE}")
-    print("=" * 60)
+    print("=" * 62)
 
     try:
         await asyncio.gather(
-            stream_video(cam),
-            stream_detection(result_queue, shared_state),  # truyền shared_state
+            stream_video(cam, loop),
+            stream_detection(result_queue, shared_state, loop),
         )
     finally:
+        cam.stop()
         buzzer.stop()
+        logger.info("[Main] Đã dừng.")
 
 
 if __name__ == "__main__":
