@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Integer, DateTime, Text, Float, Boolean
+from sqlalchemy import Column, String, Integer, DateTime, Text, Float, Boolean, ForeignKey
 from sqlalchemy.sql import func
 from database import Base
 import uuid
@@ -20,6 +20,7 @@ class Camera(Base):
     CameraIP = Column(String(50))
     CameraPhoneNum = Column(String(20))
     CameraStatus = Column(Boolean, default=True)
+    UserID = Column(String(50), ForeignKey("USERS.UserID"), nullable=False)
 
 
 class Call(Base):
@@ -27,6 +28,7 @@ class Call(Base):
     
     CallID = Column(String(50), primary_key=True, default=lambda: str(uuid.uuid4()))
     CallDate = Column(DateTime, nullable=False)
+    CameraID = Column(String(50), ForeignKey("CAMERAS.CameraID"), nullable=False)
 
 
 class ViolenceHistory(Base):
@@ -37,3 +39,4 @@ class ViolenceHistory(Base):
     Location = Column(String(255))
     ClipURL = Column(Text)
     Confidence = Column(Float)
+    CameraID = Column(String(50), ForeignKey("CAMERAS.CameraID"), nullable=False)
