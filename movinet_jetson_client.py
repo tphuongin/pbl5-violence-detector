@@ -118,7 +118,7 @@ STREAM_FPS        = 15
 JPEG_QUALITY      = 70
 
 # ── TensorRT model ───────────────────────────────────────
-ENGINE_PATH       = "movinet_stream.engine"
+ENGINE_PATH       = "movinet_v2.engine"
 INPUT_SIZE        = 172      # dùng để validate IMAGE binding khi auto-map
 
 # ── Inference timing ─────────────────────────────────────
@@ -553,12 +553,18 @@ class MoViNetTRT:
             if name != self.LOGITS_NAME
         }
 
-        if len(state_inputs) != len(state_outputs):
+        if len(state_inputs) > len(state_outputs):
             raise RuntimeError(
-                f"[TRT] Auto-map thất bại: số state input ({len(state_inputs)}) "
-                f"≠ state output ({len(state_outputs)}). Engine có vấn đề?"
+                f"[TRT] state input ({len(state_inputs)}) "
+                f"> state output ({len(state_outputs)}). Engine thiếu output state?"
             )
-
+        
+        if len(state_inputs) != len(state_outputs):
+            logger.warning(
+                f"[TRT] state input ({len(state_inputs)}) ≠ "
+                f"state output ({len(state_outputs)}) — "
+                f"bỏ qua {len(state_outputs) - len(state_inputs)} output(s) dư."
+            )
         # Group outputs theo shape để xử lý nhiều tensor cùng shape
         output_by_shape = defaultdict(dict)   # shape → {suffix → name}
         for name, shape in state_outputs.items():
