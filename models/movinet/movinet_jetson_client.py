@@ -72,12 +72,11 @@ JSON detection payload:
 Chạy: python3 movinet_jetson_client_v4.py
 """
 
-import re
 import cv2
 import numpy as np
 import tensorrt as trt
 import pycuda.driver as cuda
-from collections import defaultdict, deque
+from collections import deque
 from typing import Optional
 import threading
 import asyncio
@@ -465,43 +464,44 @@ class MoViNetTRT:
 
     # ── Auto mapping ──────────────────────────────────────
 
-    @staticmethod
-    def _state_suffix(name: str) -> str:
-        """
-        Trích phần định danh sau prefix export để dùng làm key match.
-
-        Ví dụ:
-          "serving_default_state_block0_layer0_pool_buffer:0"
-              → "block0_layer0_pool_buffer:0"
-          "call_state_block0_layer0_pool_buffer:0"
-              → "block0_layer0_pool_buffer:0"
-          "call_state_head_pool_buffer:0"
-              → "head_pool_buffer:0"
-        """
-        m = re.search(r'((?:block|head)\w+(?::\d+)?)', name)
-        return m.group(1) if m else name
-
     def _auto_map_bindings(self):
         """
         Tự động xây dựng IMAGE_NAME, LOGITS_NAME, STATE_MAP
         từ thông tin binding của engine — không phụ thuộc prefix tên.
 
-        Raises RuntimeError nếu không tìm được IMAGE hoặc LOGITS binding.
+        Tại sao dùng BINDING INDEX thay suffix matching:
+          - Output state tên "StatefulPartitionedCall:X" không chứa
+            "block"/"head" → regex suffix không extract được gì có nghĩa
+          - Fallback candidates[0] theo dict order tình cờ đúng với
+            engine cũ nhưng sai với engine mới do thứ tự binding khác
+          - TensorRT đảm bảo thứ tự binding cố định và tương ứng:
+            state_input[i] trong graph → state_output[i] trong graph
+            → map theo index là chính xác và ổn định với mọi engine
+
+        Tương thích fp16:
+          - hbuf dtype = trt.nptype() của binding (có thể float16)
+          - infer() cast logits sang float32 trước softmax để tránh
+            overflow → NaN với logits lớn trên fp16
         """
-        inputs  = {}   # name → shape  (binding is input)
-        outputs = {}   # name → shape  (binding is output)
+        # Thu thập binding theo đúng thứ tự index
+        inputs_ordered  = []   # [(index, name, shape), ...]
+        outputs_ordered = []   # [(index, name, shape), ...]
 
         for i in range(self.engine.num_bindings):
             name  = self.engine.get_binding_name(i)
             shape = tuple(self.engine.get_binding_shape(i))
             if self.engine.binding_is_input(i):
-                inputs[name] = shape
+                inputs_ordered.append((i, name, shape))
             else:
-                outputs[name] = shape
+                outputs_ordered.append((i, name, shape))
+
+        # Giữ dict để lookup shape nhanh
+        inputs  = {name: shape for _, name, shape in inputs_ordered}
+        outputs = {name: shape for _, name, shape in outputs_ordered}
 
         # ── 1. Detect IMAGE input ────────────────────────────────────────
         # Shape [1, 1, H, W, 3] — ndim=5, last dim=3 (RGB channels)
-        for name, shape in inputs.items():
+        for _, name, shape in inputs_ordered:
             if len(shape) == 5 and shape[-1] == 3:
                 self.IMAGE_NAME = name
                 break
@@ -512,25 +512,20 @@ class MoViNetTRT:
                 "(cần shape [1,1,H,W,3]). Kiểm tra lại engine."
             )
 
-        # Validate kích thước ảnh khớp với INPUT_SIZE đã config
         img_h = inputs[self.IMAGE_NAME][2]
         img_w = inputs[self.IMAGE_NAME][3]
         if img_h != INPUT_SIZE or img_w != INPUT_SIZE:
             logger.warning(
                 f"[TRT] IMAGE shape={inputs[self.IMAGE_NAME]} "
                 f"khác INPUT_SIZE={INPUT_SIZE} — "
-                f"sẽ resize về {img_h}x{img_w} thay vì {INPUT_SIZE}x{INPUT_SIZE}."
+                f"sẽ resize về {img_h}x{img_w}."
             )
-            # Cập nhật INPUT_SIZE thực tế từ engine để infer() dùng đúng
-            self._infer_h = img_h
-            self._infer_w = img_w
-        else:
-            self._infer_h = INPUT_SIZE
-            self._infer_w = INPUT_SIZE
+        self._infer_h = img_h
+        self._infer_w = img_w
 
         # ── 2. Detect LOGITS output ──────────────────────────────────────
         # Shape [1, num_classes] — ndim=2, last dim > 1
-        for name, shape in outputs.items():
+        for _, name, shape in outputs_ordered:
             if len(shape) == 2 and shape[-1] > 1:
                 self.LOGITS_NAME = name
                 break
@@ -541,68 +536,52 @@ class MoViNetTRT:
                 "(cần shape [1, N] với N>1). Kiểm tra lại engine."
             )
 
-        # ── 3. Build STATE_MAP: state inputs → state outputs ─────────────
-        state_inputs = {
-            name: shape
-            for name, shape in inputs.items()
+        # ── 3. Build STATE_MAP theo binding index ────────────────────────
+        # Lọc state inputs/outputs, GIỮ NGUYÊN thứ tự binding index
+        state_inputs_ordered = [
+            (idx, name, shape)
+            for idx, name, shape in inputs_ordered
             if name != self.IMAGE_NAME
-        }
-        state_outputs = {
-            name: shape
-            for name, shape in outputs.items()
+        ]
+        state_outputs_ordered = [
+            (idx, name, shape)
+            for idx, name, shape in outputs_ordered
             if name != self.LOGITS_NAME
-        }
+        ]
 
-        if len(state_inputs) > len(state_outputs):
+        if len(state_inputs_ordered) > len(state_outputs_ordered):
             raise RuntimeError(
-                f"[TRT] state input ({len(state_inputs)}) "
-                f"> state output ({len(state_outputs)}). Engine thiếu output state?"
+                f"[TRT] state input ({len(state_inputs_ordered)}) "
+                f"> state output ({len(state_outputs_ordered)}). "
+                f"Engine thiếu output state?"
             )
-        
-        if len(state_inputs) != len(state_outputs):
+
+        if len(state_inputs_ordered) != len(state_outputs_ordered):
             logger.warning(
-                f"[TRT] state input ({len(state_inputs)}) ≠ "
-                f"state output ({len(state_outputs)}) — "
-                f"bỏ qua {len(state_outputs) - len(state_inputs)} output(s) dư."
-            )
-        # Group outputs theo shape để xử lý nhiều tensor cùng shape
-        output_by_shape = defaultdict(dict)   # shape → {suffix → name}
-        for name, shape in state_outputs.items():
-            suffix = self._state_suffix(name)
-            output_by_shape[shape][suffix] = name
-
-        used_outputs = set()
-        unmatched    = []
-
-        for in_name, in_shape in state_inputs.items():
-            in_suffix    = self._state_suffix(in_name)
-            candidates   = output_by_shape.get(in_shape, {})
-
-            # Ưu tiên 1: khớp suffix chính xác (block/head name giống nhau)
-            if in_suffix in candidates and candidates[in_suffix] not in used_outputs:
-                matched = candidates[in_suffix]
-
-            # Ưu tiên 2: lấy output cùng shape chưa được dùng
-            else:
-                fallback = [
-                    n for n in candidates.values()
-                    if n not in used_outputs
-                ]
-                if not fallback:
-                    unmatched.append(in_name)
-                    continue
-                matched = fallback[0]
-
-            self.STATE_MAP[in_name] = matched
-            used_outputs.add(matched)
-
-        if unmatched:
-            raise RuntimeError(
-                f"[TRT] Auto-map thất bại: không tìm được output state cho "
-                f"{len(unmatched)} input(s): {unmatched[:3]} …"
+                f"[TRT] state input ({len(state_inputs_ordered)}) ≠ "
+                f"state output ({len(state_outputs_ordered)}) — "
+                f"bỏ qua {len(state_outputs_ordered) - len(state_inputs_ordered)} "
+                f"output(s) dư."
             )
 
-        logger.info(f"[TRT] Auto-mapped {len(self.STATE_MAP)} state pairs.")
+        # Map input[i] → output[i] theo thứ tự index
+        # Validate shape phải khớp — nếu không khớp là engine lỗi
+        for (_, in_name, in_shape), (_, out_name, out_shape) in zip(
+            state_inputs_ordered, state_outputs_ordered
+        ):
+            if in_shape != out_shape:
+                raise RuntimeError(
+                    f"[TRT] Shape mismatch tại vị trí map:\n"
+                    f"  input  '{in_name}' shape={in_shape}\n"
+                    f"  output '{out_name}' shape={out_shape}\n"
+                    f"Engine không phải MoViNet Stream hoặc bị corrupt."
+                )
+            self.STATE_MAP[in_name] = out_name
+
+        logger.info(
+            f"[TRT] Auto-mapped {len(self.STATE_MAP)} state pairs "
+            f"(index-based)."
+        )
 
     # ── Model operations ──────────────────────────────────
 
@@ -644,7 +623,10 @@ class MoViNetTRT:
 
             cuda.memcpy_dtoh(self.hbuf[self.LOGITS_NAME],
                              self.dbuf[self.LOGITS_NAME])
-            logits = self.hbuf[self.LOGITS_NAME].copy()
+            # Cast sang float32 trước khi tính softmax —
+            # fp16 engine trả về logits float16, np.exp() trên float16
+            # overflow khi logit > ~89 → inf → inf/inf = NaN
+            logits = self.hbuf[self.LOGITS_NAME].copy().astype(np.float32)
             exp    = np.exp(logits - logits.max())
             probs  = exp / exp.sum()
 
