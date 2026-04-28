@@ -658,7 +658,8 @@ def run_inference(cam: CameraCapture,
             if prob_raw >= CONF_THRESH:
                 is_alert    = True
                 alert_until = now + ALERT_SECONDS
-            elif now > alert_until:
+            else:
+                # Immediately turn off alert when prob drops below threshold
                 is_alert = False
 
             label = "VIOLENCE" if is_alert else "Normal"
