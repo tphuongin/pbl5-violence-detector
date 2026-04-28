@@ -642,7 +642,8 @@ class MoViNetTRT:
             for in_name, out_name in STATE_MAP.items():
                 cuda.memcpy_dtoh(self.hbuf[in_name], self.dbuf[out_name])
 
-            return float(probs[0]), float(probs[1])
+            # probs[0] = normal, probs[1] = violence (thứ tự class engine mới)
+            return float(probs[1]), float(probs[0])
         finally:
             self.cuda_ctx.pop()
 
