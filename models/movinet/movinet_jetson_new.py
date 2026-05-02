@@ -1,75 +1,12 @@
 """
-movinet_jetson_client_v4.py
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Bản mới
 
 Luồng hoạt động:
-  ┌─────────────────────────────────────┐
-  │  CameraCapture (thread)             │  ← grab frame liên tục
-  │  → set frame_event sau mỗi frame    │     (event-based sync)
-  └──────────────┬──────────────────────┘
-                 │ frame_event.wait()
-        ┌────────┴────────┐
-        ▼                 ▼
-  stream_video        run_inference (thread)
-  (async task)          TensorRT MoViNet
-        │                 │ lưu frame gốc + kết quả
-        │ JPEG binary      │ vào SharedState
-        ▼                 ▼
-  ws://.../ws/stream/   ws://.../ws/detection/
-  {CAMERA_ID}           {CAMERA_ID}
-                         │
-                         ▼
-                   BuzzerController (thread)
-                   GPIO PIN 12 — kêu khi bạo lực ≥ 5s
-
-Thay đổi so với v3:
-  [v4] Auto binding mapping trong MoViNetTRT:
-      - Bỏ hoàn toàn STATE_MAP, LOGITS_NAME, IMAGE_NAME hard-code
-      - _auto_map_bindings() tự detect sau khi load engine dựa vào shape:
-          · Input  shape [1,1,H,W,3]      → IMAGE_NAME
-          · Output shape [1, num_classes]  → LOGITS_NAME
-          · Phần còn lại → state pairs, ghép input↔output bằng:
-              1. shape matching
-              2. suffix tên sau "block..." / "head..." để phân biệt
-                 khi nhiều tensor cùng shape
-      - Tương thích cả 2 version ONNX export:
-          · Bản cũ: prefix "call_state_..." / "call_image:0"
-          · Bản mới: prefix "serving_default_state_..." /
-                     "serving_default_image:0"
-      - Chỉ cần đổi ENGINE_PATH khi dùng engine mới
-
-Changelog đầy đủ (v1 → v4):
-  [v2-1] Tách Inference ↔ Rendering — encode JPEG/thumbnail
-         chỉ trong stream_detection(), không trong inference loop
-  [v2-2] Event-based sync thay polling — frame_event.wait/clear/set
-  [v3-1] Bỏ Sliding Window Reset — MoViNet Stream tự quản lý context
-  [v3-2] Fix race condition DetectionResult — _event tạo sẵn trong __init__
-  [v3-3] Fix snapshot() deep copy raw_frame
-  [v3-4] Fix thứ tự frame_event: clear → get_latest → wait
-  [v3-5] Fix stream_video block event loop — encode qua run_in_executor
-  [v3-6] Fix trt.Runtime lifetime — giữ làm instance variable
-  [v4]   Auto binding mapping — không còn hard-code tên binding
-
-JSON detection payload:
-{
-  "camera_id":         "jetson-cam-01",
-  "timestamp":         "14:35:22.047",
-  "label":             "VIOLENCE" | "Normal",
-  "prob_raw":          0.73,
-  "prob_smooth":       0.61,
-  "confirm_count":     2,
-  "confirm_needed":    2,
-  "threshold":         0.5,
-  "infer_fps":         12.3,
-  "cam_fps":           29.8,
-  "uptime":            142,
-  "infer_ms":          48.2,
-  "violence_duration": 3.7,
-  "buzzer_active":     false,
-  "thumb_b64":         "<base64 jpeg 120x68>"
-}
-
-Chạy: python3 movinet_jetson_client_v4.py
+  CameraCapture (thread) → frame_event
+      ├── stream_video    (async) → ws://.../ws/stream/{CAMERA_ID}
+      └── run_inference   (thread) → SharedState + DetectionResult
+              └── stream_detection (async) → ws://.../ws/detection/{CAMERA_ID}
+                      └── BuzzerController (thread) → GPIO PIN 12
 """
 
 import cv2
@@ -97,53 +34,41 @@ except ImportError:
 #  CONFIG
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-# ── Backend ──────────────────────────────────────────────
-BACKEND_HOST      = "192.168.137.1"
-BACKEND_PORT      = 8000
-CAMERA_ID         = "jetson-cam-01"
+BACKEND_HOST     = "192.168.137.1"
+BACKEND_PORT     = 8000
+CAMERA_ID        = "jetson-cam-01"
 
-WS_STREAM_URL     = f"ws://{BACKEND_HOST}:{BACKEND_PORT}/ws/stream/{CAMERA_ID}"
-WS_DETECTION_URL  = f"ws://{BACKEND_HOST}:{BACKEND_PORT}/ws/detection/{CAMERA_ID}"
+WS_STREAM_URL    = f"ws://{BACKEND_HOST}:{BACKEND_PORT}/ws/stream/{CAMERA_ID}"
+WS_DETECTION_URL = f"ws://{BACKEND_HOST}:{BACKEND_PORT}/ws/detection/{CAMERA_ID}"
+RECONNECT_DELAY  = 3
 
-RECONNECT_DELAY   = 3       # giây chờ trước khi reconnect WebSocket
+CAMERA_WIDTH     = 640
+CAMERA_HEIGHT    = 480
+CAMERA_FPS       = 30
 
-# ── Camera ───────────────────────────────────────────────
-CAMERA_WIDTH      = 640
-CAMERA_HEIGHT     = 480
-CAMERA_FPS        = 30
+STREAM_FPS       = 15
+JPEG_QUALITY     = 70
 
-# ── Stream video ─────────────────────────────────────────
-STREAM_FPS        = 15
-JPEG_QUALITY      = 70
+ENGINE_PATH      = "movinet_v2.engine"
+INPUT_SIZE       = 172
 
-# ── TensorRT model ───────────────────────────────────────
-ENGINE_PATH       = "movinet_v2.engine"
-INPUT_SIZE        = 172      # dùng để validate IMAGE binding khi auto-map
+INFER_INTERVAL_MS = 80
 
-# ── Inference timing ─────────────────────────────────────
-INFER_INTERVAL_MS = 80       # ~12 lần/giây
+EMA_ALPHA        = 0.35
+SPIKE_THRESH     = 0.12
+SPIKE_BOOST      = 1.35
 
-# ── EMA smoothing ────────────────────────────────────────
-EMA_ALPHA         = 0.35
+THRESHOLD        = 0.50
+CONFIRM_FRAMES   = 2
+COOLDOWN_SEC     = 0.8
 
-# ── Peak boost ───────────────────────────────────────────
-SPIKE_THRESH      = 0.12
-SPIKE_BOOST       = 1.35
+THUMB_WIDTH      = 120
+THUMB_HEIGHT     = 68
 
-# ── Decision ─────────────────────────────────────────────
-THRESHOLD         = 0.50
-CONFIRM_FRAMES    = 2
-COOLDOWN_SEC      = 0.8
-
-# ── Thumbnail ────────────────────────────────────────────
-THUMB_WIDTH       = 120
-THUMB_HEIGHT      = 68
-
-# ── Buzzer (GPIO) ─────────────────────────────────────────
-BUZZER_PIN              = 12
-VIOLENCE_BUZZER_DELAY   = 5.0
-BUZZER_BEEP_ON_SEC      = 0.5
-BUZZER_BEEP_OFF_SEC     = 0.3
+BUZZER_PIN             = 12
+VIOLENCE_BUZZER_DELAY  = 5.0
+BUZZER_BEEP_ON_SEC     = 0.5
+BUZZER_BEEP_OFF_SEC    = 0.3
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -156,21 +81,62 @@ logger = logging.getLogger("jetson")
 
 TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
 
+# class 0 = Normal, class 1 = Violence
+IMAGE_NAME  = 'serving_default_image:0'
+LOGITS_NAME = 'StatefulPartitionedCall:0'
+
+STATE_MAP = {
+    'serving_default_state_block4_layer1_pool_frame_count:0': 'StatefulPartitionedCall:37',
+    'serving_default_state_block1_layer1_stream_buffer:0': 'StatefulPartitionedCall:8',
+    'serving_default_state_block1_layer2_stream_buffer:0': 'StatefulPartitionedCall:11',
+    'serving_default_state_block3_layer1_pool_frame_count:0': 'StatefulPartitionedCall:25',
+    'serving_default_state_block3_layer2_pool_buffer:0': 'StatefulPartitionedCall:27',
+    'serving_default_state_block3_layer3_pool_frame_count:0': 'StatefulPartitionedCall:31',
+    'serving_default_state_block4_layer0_pool_buffer:0': 'StatefulPartitionedCall:33',
+    'serving_default_state_head_pool_frame_count:0': 'StatefulPartitionedCall:43',
+    'serving_default_state_block3_layer0_stream_buffer:0': 'StatefulPartitionedCall:23',
+    'serving_default_state_block2_layer2_stream_buffer:0': 'StatefulPartitionedCall:20',
+    'serving_default_state_block2_layer1_pool_buffer:0': 'StatefulPartitionedCall:15',
+    'serving_default_state_block2_layer1_stream_buffer:0': 'StatefulPartitionedCall:17',
+    'serving_default_state_block3_layer1_stream_buffer:0': 'StatefulPartitionedCall:26',
+    'serving_default_state_block4_layer0_pool_frame_count:0': 'StatefulPartitionedCall:34',
+    'serving_default_state_block3_layer3_stream_buffer:0': 'StatefulPartitionedCall:32',
+    'serving_default_state_block1_layer1_pool_buffer:0': 'StatefulPartitionedCall:6',
+    'serving_default_state_block3_layer2_pool_frame_count:0': 'StatefulPartitionedCall:28',
+    'serving_default_state_block0_layer0_pool_buffer:0': 'StatefulPartitionedCall:1',
+    'serving_default_state_block0_layer0_pool_frame_count:0': 'StatefulPartitionedCall:2',
+    'serving_default_state_block1_layer0_pool_frame_count:0': 'StatefulPartitionedCall:4',
+    'serving_default_state_block3_layer0_pool_buffer:0': 'StatefulPartitionedCall:21',
+    'serving_default_state_block2_layer2_pool_frame_count:0': 'StatefulPartitionedCall:19',
+    'serving_default_state_block2_layer0_pool_frame_count:0': 'StatefulPartitionedCall:13',
+    'serving_default_state_block4_layer2_pool_frame_count:0': 'StatefulPartitionedCall:39',
+    'serving_default_state_block1_layer1_pool_frame_count:0': 'StatefulPartitionedCall:7',
+    'serving_default_state_block3_layer2_stream_buffer:0': 'StatefulPartitionedCall:29',
+    'serving_default_state_block4_layer0_stream_buffer:0': 'StatefulPartitionedCall:35',
+    'serving_default_state_block1_layer0_stream_buffer:0': 'StatefulPartitionedCall:5',
+    'serving_default_state_block3_layer1_pool_buffer:0': 'StatefulPartitionedCall:24',
+    'serving_default_state_block4_layer3_pool_buffer:0': 'StatefulPartitionedCall:40',
+    'serving_default_state_block1_layer0_pool_buffer:0': 'StatefulPartitionedCall:3',
+    'serving_default_state_block3_layer0_pool_frame_count:0': 'StatefulPartitionedCall:22',
+    'serving_default_state_block2_layer0_stream_buffer:0': 'StatefulPartitionedCall:14',
+    'serving_default_state_block2_layer2_pool_buffer:0': 'StatefulPartitionedCall:18',
+    'serving_default_state_head_pool_buffer:0': 'StatefulPartitionedCall:42',
+    'serving_default_state_block4_layer1_pool_buffer:0': 'StatefulPartitionedCall:36',
+    'serving_default_state_block1_layer2_pool_frame_count:0': 'StatefulPartitionedCall:10',
+    'serving_default_state_block1_layer2_pool_buffer:0': 'StatefulPartitionedCall:9',
+    'serving_default_state_block2_layer0_pool_buffer:0': 'StatefulPartitionedCall:12',
+    'serving_default_state_block4_layer3_pool_frame_count:0': 'StatefulPartitionedCall:41',
+    'serving_default_state_block4_layer2_pool_buffer:0': 'StatefulPartitionedCall:38',
+    'serving_default_state_block3_layer3_pool_buffer:0': 'StatefulPartitionedCall:30',
+    'serving_default_state_block2_layer1_pool_frame_count:0': 'StatefulPartitionedCall:16'
+}
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  SHARED STATE
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class SharedState:
-    """
-    Thread-safe container lưu frame gốc numpy và kết quả inference
-    mới nhất. Tách hoàn toàn khỏi việc encode JPEG/thumbnail.
-
-    update()   — gọi từ inference thread
-    snapshot() — gọi từ bất kỳ thread/coroutine nào,
-                 trả về deep copy của raw_frame để tránh race condition
-    """
-
     def __init__(self):
         self._lock        = threading.Lock()
         self._raw_frame   = None
@@ -178,11 +144,8 @@ class SharedState:
         self._prob_smooth = 0.0
         self._label       = 'Normal'
 
-    def update(self,
-               raw_frame: np.ndarray,
-               prob_raw: float,
-               prob_smooth: float,
-               label: str) -> None:
+    def update(self, raw_frame: np.ndarray, prob_raw: float,
+               prob_smooth: float, label: str) -> None:
         with self._lock:
             self._raw_frame   = raw_frame.copy()
             self._prob_raw    = prob_raw
@@ -190,11 +153,6 @@ class SharedState:
             self._label       = label
 
     def snapshot(self) -> Optional[dict]:
-        """
-        Trả về dict hoặc None nếu chưa có dữ liệu.
-        raw_frame là deep copy — caller tự do thao tác mà không
-        ảnh hưởng buffer nội bộ hay lần infer kế tiếp.
-        """
         with self._lock:
             if self._raw_frame is None:
                 return None
@@ -207,11 +165,6 @@ class SharedState:
 
 
 def render_and_encode_thumb(raw_frame: np.ndarray) -> str:
-    """
-    Thu nhỏ frame thành thumbnail, trả về chuỗi base64 JPEG.
-    Gọi từ stream_detection() qua run_in_executor() —
-    KHÔNG gọi từ run_inference().
-    """
     thumb = cv2.resize(raw_frame, (THUMB_WIDTH, THUMB_HEIGHT),
                        interpolation=cv2.INTER_LINEAR)
     _, buf = cv2.imencode('.jpg', thumb, [cv2.IMWRITE_JPEG_QUALITY, 70])
@@ -219,11 +172,6 @@ def render_and_encode_thumb(raw_frame: np.ndarray) -> str:
 
 
 def encode_frame_jpeg(frame: np.ndarray, quality: int = JPEG_QUALITY) -> bytes:
-    """
-    Encode frame thành JPEG bytes.
-    Chạy qua run_in_executor() trong stream_video() —
-    tránh block asyncio event loop.
-    """
     _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
     return buf.tobytes()
 
@@ -233,20 +181,12 @@ def encode_frame_jpeg(frame: np.ndarray, quality: int = JPEG_QUALITY) -> bytes:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class BuzzerController(threading.Thread):
-    """
-    Thread quản lý còi GPIO độc lập.
-
-    activate()   — bắt đầu beep lặp lại
-    deactivate() — tắt còi
-    stop()       — dừng thread + cleanup GPIO
-    """
-
     def __init__(self):
         super().__init__(daemon=True, name="BuzzerThread")
-        self._active   = False
-        self._running  = True
-        self._lock     = threading.Lock()
-        self._cond     = threading.Condition(self._lock)
+        self._active  = False
+        self._running = True
+        self._lock    = threading.Lock()
+        self._cond    = threading.Condition(self._lock)
         self.available = GPIO_AVAILABLE
 
         if self.available:
@@ -290,12 +230,10 @@ class BuzzerController(threading.Thread):
                         self._cond.wait(timeout=1.0)
                     if not self._running:
                         break
-
                 self._set_gpio(True)
                 self._interruptible_sleep(BUZZER_BEEP_ON_SEC)
                 self._set_gpio(False)
                 self._interruptible_sleep(BUZZER_BEEP_OFF_SEC)
-
         except Exception as e:
             logger.exception(f"[Buzzer] Lỗi thread: {e}")
         finally:
@@ -307,9 +245,8 @@ class BuzzerController(threading.Thread):
     def _set_gpio(self, state: bool):
         if self.available:
             GPIO.output(BUZZER_PIN, GPIO.LOW if state else GPIO.HIGH)
-        else:
-            if state:
-                logger.debug("[Buzzer][SIM] BEEP ON")
+        elif state:
+            logger.debug("[Buzzer][SIM] BEEP ON")
 
     def _interruptible_sleep(self, seconds: float):
         deadline = time.time() + seconds
@@ -351,7 +288,7 @@ class CameraCapture(threading.Thread):
 
     def run(self):
         cap = None
-        for idx in [0, 1, 2, 3, 4]:
+        for idx in range(5):
             logger.info(f"[Camera] Thử index {idx} …")
             cap = self._try_open(idx)
             if cap is not None:
@@ -359,7 +296,7 @@ class CameraCapture(threading.Thread):
                 break
 
         if cap is None:
-            self.error_msg = "Không mở được camera nào (đã thử 0,1,2,3,4)"
+            self.error_msg = "Không mở được camera nào (đã thử 0–4)"
             logger.error(f"[Camera] {self.error_msg}")
             return
 
@@ -395,171 +332,15 @@ class CameraCapture(threading.Thread):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  TENSORRT MODEL — Hard-coded cho engine mới (serving_default_)
-#  Engine: fp16, export từ TF SavedModel qua tf2onnx
+#  TENSORRT MODEL
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-# Input image
-IMAGE_NAME  = 'serving_default_image:0'
-
-# Output logits — shape [1, 2]: [prob_violence, prob_normal]
-LOGITS_NAME = 'StatefulPartitionedCall:0'
-
-# STATE_MAP: input_name → output_name
-# Thứ tự theo binding index từ shape.txt của engine mới.
-# input[i] → output[i] (bỏ IMAGE input và LOGITS output)
-#
-# Input binding order (bỏ serving_default_image:0 ở index 37):
-#   0:  serving_default_state_block4_layer1_pool_frame_count:0  [1]
-#   1:  serving_default_state_block1_layer1_stream_buffer:0     [1,2,22,22,80]
-#   2:  serving_default_state_block1_layer2_stream_buffer:0     [1,2,22,22,80]
-#   3:  serving_default_state_block3_layer1_pool_frame_count:0  [1]
-#   4:  serving_default_state_block3_layer2_pool_buffer:0       [1,1,1,1,184]
-#   5:  serving_default_state_block3_layer3_pool_frame_count:0  [1]
-#   6:  serving_default_state_block4_layer0_pool_buffer:0       [1,1,1,1,384]
-#   7:  serving_default_state_head_pool_frame_count:0           [1]
-#   8:  serving_default_state_block3_layer0_stream_buffer:0     [1,4,11,11,184]
-#   9:  serving_default_state_block2_layer2_stream_buffer:0     [1,2,11,11,184]
-#   10: serving_default_state_block2_layer1_pool_buffer:0       [1,1,1,1,112]
-#   11: serving_default_state_block2_layer1_stream_buffer:0     [1,2,11,11,112]
-#   12: serving_default_state_block3_layer1_stream_buffer:0     [1,2,11,11,184]
-#   13: serving_default_state_block4_layer0_pool_frame_count:0  [1]
-#   14: serving_default_state_block3_layer3_stream_buffer:0     [1,2,11,11,184]
-#   15: serving_default_state_block1_layer1_pool_buffer:0       [1,1,1,1,80]
-#   16: serving_default_state_block3_layer2_pool_frame_count:0  [1]
-#   17: serving_default_state_block0_layer0_pool_buffer:0       [1,1,1,1,24]
-#   18: serving_default_state_block0_layer0_pool_frame_count:0  [1]
-#   19: serving_default_state_block1_layer0_pool_frame_count:0  [1]
-#   20: serving_default_state_block3_layer0_pool_buffer:0       [1,1,1,1,184]
-#   21: serving_default_state_block2_layer2_pool_frame_count:0  [1]
-#   22: serving_default_state_block2_layer0_pool_frame_count:0  [1]
-#   23: serving_default_state_block4_layer2_pool_frame_count:0  [1]
-#   24: serving_default_state_block1_layer1_pool_frame_count:0  [1]
-#   25: serving_default_state_block3_layer2_stream_buffer:0     [1,2,11,11,184]
-#   26: serving_default_state_block4_layer0_stream_buffer:0     [1,4,6,6,384]
-#   27: serving_default_state_block1_layer0_stream_buffer:0     [1,2,22,22,80]
-#   28: serving_default_state_block3_layer1_pool_buffer:0       [1,1,1,1,184]
-#   29: serving_default_state_block4_layer3_pool_buffer:0       [1,1,1,1,344]
-#   30: serving_default_state_block1_layer0_pool_buffer:0       [1,1,1,1,80]
-#   31: serving_default_state_block3_layer0_pool_frame_count:0  [1]
-#   32: serving_default_state_block2_layer0_stream_buffer:0     [1,4,11,11,184]
-#   33: serving_default_state_block2_layer2_pool_buffer:0       [1,1,1,1,184]
-#   34: serving_default_state_head_pool_buffer:0                [1,1,1,1,480]
-#   35: serving_default_state_block4_layer1_pool_buffer:0       [1,1,1,1,280]
-#   36: serving_default_state_block1_layer2_pool_frame_count:0  [1]
-#   -- (37 = IMAGE — bỏ qua)
-#   38: serving_default_state_block1_layer2_pool_buffer:0       [1,1,1,1,80]
-#   39: serving_default_state_block2_layer0_pool_buffer:0       [1,1,1,1,184]
-#   40: serving_default_state_block4_layer3_pool_frame_count:0  [1]
-#   41: serving_default_state_block4_layer2_pool_buffer:0       [1,1,1,1,280]
-#   42: serving_default_state_block3_layer3_pool_buffer:0       [1,1,1,1,184]
-#   43: serving_default_state_block2_layer1_pool_frame_count:0  [1]
-#
-# Output binding order (bỏ StatefulPartitionedCall:0 ở index 10):
-#   0:  StatefulPartitionedCall:37  [1]
-#   1:  StatefulPartitionedCall:8   [1,2,22,22,80]
-#   2:  StatefulPartitionedCall:11  [1,2,22,22,80]
-#   3:  StatefulPartitionedCall:25  [1]
-#   4:  StatefulPartitionedCall:27  [1,1,1,1,184]
-#   5:  StatefulPartitionedCall:31  [1]
-#   6:  StatefulPartitionedCall:33  [1,1,1,1,384]
-#   7:  StatefulPartitionedCall:43  [1]
-#   8:  StatefulPartitionedCall:23  [1,4,11,11,184]
-#   9:  StatefulPartitionedCall:20  [1,2,11,11,184]
-#   -- (10 = LOGITS — bỏ qua)
-#   10: StatefulPartitionedCall:15  [1,1,1,1,112]
-#   11: StatefulPartitionedCall:17  [1,2,11,11,112]
-#   12: StatefulPartitionedCall:26  [1,2,11,11,184]
-#   13: StatefulPartitionedCall:34  [1]
-#   14: StatefulPartitionedCall:32  [1,2,11,11,184]
-#   15: StatefulPartitionedCall:6   [1,1,1,1,80]
-#   16: StatefulPartitionedCall:28  [1]
-#   17: StatefulPartitionedCall:1   [1,1,1,1,24]
-#   18: StatefulPartitionedCall:2   [1]
-#   19: StatefulPartitionedCall:4   [1]
-#   20: StatefulPartitionedCall:21  [1,1,1,1,184]
-#   21: StatefulPartitionedCall:19  [1]
-#   22: StatefulPartitionedCall:13  [1]
-#   23: StatefulPartitionedCall:39  [1]
-#   24: StatefulPartitionedCall:7   [1]
-#   25: StatefulPartitionedCall:29  [1,2,11,11,184]
-#   26: StatefulPartitionedCall:35  [1,4,6,6,384]
-#   27: StatefulPartitionedCall:5   [1,2,22,22,80]
-#   28: StatefulPartitionedCall:24  [1,1,1,1,184]
-#   29: StatefulPartitionedCall:40  [1,1,1,1,344]
-#   30: StatefulPartitionedCall:3   [1,1,1,1,80]
-#   31: StatefulPartitionedCall:22  [1]
-#   32: StatefulPartitionedCall:14  [1,4,11,11,184]
-#   33: StatefulPartitionedCall:18  [1,1,1,1,184]
-#   34: StatefulPartitionedCall:42  [1,1,1,1,480]
-#   35: StatefulPartitionedCall:36  [1,1,1,1,280]
-#   36: StatefulPartitionedCall:10  [1]
-#   37: StatefulPartitionedCall:9   [1,1,1,1,80]
-#   38: StatefulPartitionedCall:12  [1,1,1,1,184]
-#   39: StatefulPartitionedCall:41  [1]
-#   40: StatefulPartitionedCall:38  [1,1,1,1,280]
-#   41: StatefulPartitionedCall:30  [1,1,1,1,184]
-#   42: StatefulPartitionedCall:16  [1]
-
-STATE_MAP = {
-    'serving_default_state_block4_layer1_pool_frame_count:0': 'StatefulPartitionedCall:37',
-    'serving_default_state_block1_layer1_stream_buffer:0':    'StatefulPartitionedCall:8',
-    'serving_default_state_block1_layer2_stream_buffer:0':    'StatefulPartitionedCall:11',
-    'serving_default_state_block3_layer1_pool_frame_count:0': 'StatefulPartitionedCall:25',
-    'serving_default_state_block3_layer2_pool_buffer:0':      'StatefulPartitionedCall:27',
-    'serving_default_state_block3_layer3_pool_frame_count:0': 'StatefulPartitionedCall:31',
-    'serving_default_state_block4_layer0_pool_buffer:0':      'StatefulPartitionedCall:33',
-    'serving_default_state_head_pool_frame_count:0':          'StatefulPartitionedCall:43',
-    'serving_default_state_block3_layer0_stream_buffer:0':    'StatefulPartitionedCall:23',
-    'serving_default_state_block2_layer2_stream_buffer:0':    'StatefulPartitionedCall:20',
-    'serving_default_state_block2_layer1_pool_buffer:0':      'StatefulPartitionedCall:15',
-    'serving_default_state_block2_layer1_stream_buffer:0':    'StatefulPartitionedCall:17',
-    'serving_default_state_block3_layer1_stream_buffer:0':    'StatefulPartitionedCall:26',
-    'serving_default_state_block4_layer0_pool_frame_count:0': 'StatefulPartitionedCall:34',
-    'serving_default_state_block3_layer3_stream_buffer:0':    'StatefulPartitionedCall:32',
-    'serving_default_state_block1_layer1_pool_buffer:0':      'StatefulPartitionedCall:6',
-    'serving_default_state_block3_layer2_pool_frame_count:0': 'StatefulPartitionedCall:28',
-    'serving_default_state_block0_layer0_pool_buffer:0':      'StatefulPartitionedCall:1',
-    'serving_default_state_block0_layer0_pool_frame_count:0': 'StatefulPartitionedCall:2',
-    'serving_default_state_block1_layer0_pool_frame_count:0': 'StatefulPartitionedCall:4',
-    'serving_default_state_block3_layer0_pool_buffer:0':      'StatefulPartitionedCall:21',
-    'serving_default_state_block2_layer2_pool_frame_count:0': 'StatefulPartitionedCall:19',
-    'serving_default_state_block2_layer0_pool_frame_count:0': 'StatefulPartitionedCall:13',
-    'serving_default_state_block4_layer2_pool_frame_count:0': 'StatefulPartitionedCall:39',
-    'serving_default_state_block1_layer1_pool_frame_count:0': 'StatefulPartitionedCall:7',
-    'serving_default_state_block3_layer2_stream_buffer:0':    'StatefulPartitionedCall:29',
-    'serving_default_state_block4_layer0_stream_buffer:0':    'StatefulPartitionedCall:35',
-    'serving_default_state_block1_layer0_stream_buffer:0':    'StatefulPartitionedCall:5',
-    'serving_default_state_block3_layer1_pool_buffer:0':      'StatefulPartitionedCall:24',
-    'serving_default_state_block4_layer3_pool_buffer:0':      'StatefulPartitionedCall:40',
-    'serving_default_state_block1_layer0_pool_buffer:0':      'StatefulPartitionedCall:3',
-    'serving_default_state_block3_layer0_pool_frame_count:0': 'StatefulPartitionedCall:22',
-    'serving_default_state_block2_layer0_stream_buffer:0':    'StatefulPartitionedCall:14',
-    'serving_default_state_block2_layer2_pool_buffer:0':      'StatefulPartitionedCall:18',
-    'serving_default_state_head_pool_buffer:0':               'StatefulPartitionedCall:42',
-    'serving_default_state_block4_layer1_pool_buffer:0':      'StatefulPartitionedCall:36',
-    'serving_default_state_block1_layer2_pool_frame_count:0': 'StatefulPartitionedCall:10',
-    'serving_default_state_block1_layer2_pool_buffer:0':      'StatefulPartitionedCall:9',
-    'serving_default_state_block2_layer0_pool_buffer:0':      'StatefulPartitionedCall:12',
-    'serving_default_state_block4_layer3_pool_frame_count:0': 'StatefulPartitionedCall:41',
-    'serving_default_state_block4_layer2_pool_buffer:0':      'StatefulPartitionedCall:38',
-    'serving_default_state_block3_layer3_pool_buffer:0':      'StatefulPartitionedCall:30',
-    'serving_default_state_block2_layer1_pool_frame_count:0': 'StatefulPartitionedCall:16',
-}
-
-TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
-
 
 class MoViNetTRT:
     """
-    Wrapper TensorRT cho MoViNet-A2 Stream — engine mới (fp16).
-    Binding names: prefix 'serving_default_'.
-    STATE_MAP hard-coded trực tiếp theo binding index từ shape.txt.
-
-    Không có sliding window reset:
-      MoViNet Stream buffer tự quản lý temporal context qua EMA
-      nội bộ — không tích lũy nhiễu theo thời gian.
-      reset_states() chỉ gọi khi khởi tạo hoặc camera reconnect.
+    Wrapper TensorRT cho MoViNet-A2 Stream (fp16).
+    - class 0 → Normal, class 1 → Violence
+    - Stream state tự quản lý temporal context; reset_states() chỉ gọi
+      khi khởi tạo hoặc camera reconnect.
     """
 
     def __init__(self, engine_path: str, cuda_ctx):
@@ -588,29 +369,19 @@ class MoViNetTRT:
         self.cuda_ctx.pop()
 
         logger.info(
-            f"[TRT] Loaded — {self.engine.num_bindings} bindings\n"
-            f"      IMAGE  : {IMAGE_NAME}\n"
-            f"      LOGITS : {LOGITS_NAME}\n"
-            f"      States : {len(STATE_MAP)} pairs"
+            f"[TRT] Loaded — {self.engine.num_bindings} bindings  "
+            f"states={len(STATE_MAP)} pairs"
         )
 
     def reset_states(self):
-        """
-        Zero toàn bộ stream state của MoViNet.
-        Chỉ gọi khi khởi tạo hoặc camera reconnect —
-        KHÔNG gọi định kỳ vì sẽ làm mất temporal context.
-        """
         for name in STATE_MAP:
             self.hbuf[name].fill(0)
             cuda.memcpy_htod(self.dbuf[name], self.hbuf[name])
 
-    def infer(self, frame_bgr: np.ndarray):
+    def infer(self, frame_bgr: np.ndarray) -> float:
         """
-        Chạy inference 1 frame, trả về (prob_violence, prob_normal).
-        Stream state được cập nhật nội bộ sau mỗi lần infer.
-
-        fp16 safety: cast logits sang float32 trước softmax để tránh
-        overflow (fp16 max ≈ 65504, exp() overflow tại logit > ~89 → NaN).
+        Chạy inference 1 frame.
+        Trả về prob_violence (class 1, float32 sau softmax).
         """
         self.cuda_ctx.push()
         try:
@@ -633,17 +404,14 @@ class MoViNetTRT:
             self.context.execute_v2(bindings)
 
             cuda.memcpy_dtoh(self.hbuf[LOGITS_NAME], self.dbuf[LOGITS_NAME])
-            # Cast float16 → float32 trước softmax
             logits = self.hbuf[LOGITS_NAME].copy().astype(np.float32)
             exp    = np.exp(logits - logits.max())
-            probs  = exp / exp.sum()
+            probs  = exp / exp.sum()  # probs[0]=Normal, probs[1]=Violence
 
-            # Cập nhật stream state cho frame tiếp theo
             for in_name, out_name in STATE_MAP.items():
                 cuda.memcpy_dtoh(self.hbuf[in_name], self.dbuf[out_name])
 
-            # probs[0] = normal, probs[1] = violence (thứ tự class engine mới)
-            return float(probs[1]), float(probs[0])
+            return float(probs[1])
         finally:
             self.cuda_ctx.pop()
 
@@ -653,28 +421,18 @@ class MoViNetTRT:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class DetectionResult:
-    """
-    Thread-safe bridge giữa inference thread (put) và
-    asyncio coroutine (get_new).
-
-    _event tạo sẵn trong __init__ để tránh race condition
-    khi put() được gọi trước get_new() lần đầu.
-    """
-
     def __init__(self, loop: asyncio.AbstractEventLoop):
         self._lock  = threading.Lock()
         self._data  = None
         self._loop  = loop
-        self._event = asyncio.Event()   # tạo sẵn, không lazy
+        self._event = asyncio.Event()
 
     def put(self, data: dict):
-        """Gọi từ inference thread."""
         with self._lock:
             self._data = data
         self._loop.call_soon_threadsafe(self._event.set)
 
     async def get_new(self) -> dict:
-        """Chờ result mới. Gọi từ asyncio coroutine."""
         await self._event.wait()
         self._event.clear()
         with self._lock:
@@ -691,20 +449,6 @@ def run_inference(cam: CameraCapture,
                   result_queue: DetectionResult,
                   buzzer: BuzzerController,
                   start_time: float):
-    """
-    Inference loop:
-      1. Chờ frame mới qua frame_event (event-based, không busy-poll)
-      2. model.infer() → prob_raw, prob_smooth, label
-      3. shared_state.update() — lưu frame gốc numpy + kết quả
-      4. result_queue.put() — payload KHÔNG chứa thumbnail
-
-    Thumbnail encode được thực hiện bởi stream_detection()
-    qua render_and_encode_thumb() + run_in_executor().
-
-    Không có sliding window reset:
-      MoViNet Stream buffer tự quản lý temporal context —
-      reset định kỳ làm mất context và gây warm-up lag ~1s.
-    """
     cuda.init()
     cuda_ctx = cuda.Device(0).make_context()
 
@@ -725,15 +469,13 @@ def run_inference(cam: CameraCapture,
     confirm_count       = 0
     violence_until      = 0.0
     violence_start_time = None
+    last_infer_ms       = 0.0
 
-    cam_times     = deque(maxlen=60)
-    infer_times   = deque(maxlen=30)
-    last_infer_ms = 0.0
+    cam_times   = deque(maxlen=60)
+    infer_times = deque(maxlen=30)
 
     try:
         while True:
-            # Thứ tự: clear → get_latest → (xử lý) → wait
-            # clear trước để không bỏ sót frame mới ghi sau get_latest
             frame_event.clear()
             frame = cam.get_latest()
 
@@ -744,27 +486,25 @@ def run_inference(cam: CameraCapture,
             now    = time.time()
             now_ms = now * 1000
 
-            # Throttle: bỏ qua frame nếu chưa đến interval tiếp theo
             if (now_ms - last_infer_ms) < INFER_INTERVAL_MS:
                 frame_event.wait(timeout=0.1)
                 continue
 
-            t0 = time.time()
-            prob_raw, _ = model.infer(frame)
-            t1 = time.time()
+            t0        = time.time()
+            prob_raw  = model.infer(frame)
+            t1        = time.time()
             last_infer_ms = now_ms
             infer_times.append(t1)
 
-            # ── EMA smoothing ─────────────────────────────────────────────
+            # EMA smoothing
             prob_smooth = EMA_ALPHA * prob_raw + (1.0 - EMA_ALPHA) * prob_smooth
 
-            # ── Spike boost ───────────────────────────────────────────────
-            delta = prob_raw - prev_prob_raw
-            if delta > SPIKE_THRESH:
+            # Spike boost
+            if (prob_raw - prev_prob_raw) > SPIKE_THRESH:
                 prob_smooth = min(1.0, prob_smooth * SPIKE_BOOST)
             prev_prob_raw = prob_raw
 
-            # ── Confirm + cooldown ────────────────────────────────────────
+            # Confirm + cooldown
             if prob_smooth >= THRESHOLD:
                 confirm_count += 1
             else:
@@ -775,10 +515,9 @@ def run_inference(cam: CameraCapture,
 
             label = 'VIOLENCE' if now < violence_until else 'Normal'
 
-            # Lưu frame gốc numpy — KHÔNG encode JPEG ở đây
             shared_state.update(frame, prob_raw, prob_smooth, label)
 
-            # ── Buzzer logic ──────────────────────────────────────────────
+            # Buzzer logic
             if label == 'VIOLENCE':
                 if violence_start_time is None:
                     violence_start_time = now
@@ -789,8 +528,7 @@ def run_inference(cam: CameraCapture,
                 else:
                     logger.debug(
                         f"[Buzzer] {violence_duration:.1f}s "
-                        f"/ {VIOLENCE_BUZZER_DELAY}s "
-                        f"(còn {VIOLENCE_BUZZER_DELAY - violence_duration:.1f}s)"
+                        f"/ {VIOLENCE_BUZZER_DELAY}s"
                     )
             else:
                 if violence_start_time is not None:
@@ -802,12 +540,12 @@ def run_inference(cam: CameraCapture,
                 buzzer.deactivate()
                 violence_duration = 0.0
 
-            # ── FPS ───────────────────────────────────────────────────────
+            # FPS
+            cam_times.append(now)
             infer_fps = (
                 (len(infer_times) - 1) / (infer_times[-1] - infer_times[0])
                 if len(infer_times) > 1 else 0.0
             )
-            cam_times.append(now)
             cam_fps = (
                 (len(cam_times) - 1) / (cam_times[-1] - cam_times[0])
                 if len(cam_times) > 1 else 0.0
@@ -815,21 +553,20 @@ def run_inference(cam: CameraCapture,
 
             ts_str = time.strftime('%H:%M:%S') + f'.{int((now % 1) * 1000):03d}'
 
-            # thumb_b64 được thêm bởi stream_detection()
             payload = {
                 "camera_id":         CAMERA_ID,
                 "timestamp":         ts_str,
                 "label":             label,
-                "prob_raw":          round(prob_raw,           4),
-                "prob_smooth":       round(prob_smooth,         4),
+                "prob_raw":          round(prob_raw,          4),
+                "prob_smooth":       round(prob_smooth,        4),
                 "confirm_count":     confirm_count,
                 "confirm_needed":    CONFIRM_FRAMES,
                 "threshold":         THRESHOLD,
-                "infer_fps":         round(infer_fps,          1),
-                "cam_fps":           round(cam_fps,            1),
+                "infer_fps":         round(infer_fps,         1),
+                "cam_fps":           round(cam_fps,           1),
                 "uptime":            int(now - start_time),
-                "infer_ms":          round((t1 - t0) * 1000,   1),
-                "violence_duration": round(violence_duration,   2),
+                "infer_ms":          round((t1 - t0) * 1000,  1),
+                "violence_duration": round(violence_duration,  2),
                 "buzzer_active":     buzzer.is_active,
             }
 
@@ -859,10 +596,6 @@ def run_inference(cam: CameraCapture,
 
 async def stream_video(cam: CameraCapture,
                        loop: asyncio.AbstractEventLoop):
-    """
-    Gửi JPEG frame liên tục lên ws://.../ws/stream/{CAMERA_ID}.
-    cv2.imencode() chạy trong run_in_executor() — không block event loop.
-    """
     interval = 1.0 / STREAM_FPS
     while True:
         try:
@@ -877,15 +610,10 @@ async def stream_video(cam: CameraCapture,
                         )
                         await ws.send(jpeg_bytes)
                     await asyncio.sleep(max(0.0, interval - (time.time() - t0)))
-
         except websockets.exceptions.ConnectionClosed:
-            logger.warning(
-                f"[Stream] Mất kết nối, thử lại sau {RECONNECT_DELAY}s …"
-            )
+            logger.warning(f"[Stream] Mất kết nối, thử lại sau {RECONNECT_DELAY}s …")
         except Exception as e:
-            logger.error(
-                f"[Stream] Lỗi: {e}, thử lại sau {RECONNECT_DELAY}s …"
-            )
+            logger.error(f"[Stream] Lỗi: {e}, thử lại sau {RECONNECT_DELAY}s …")
         await asyncio.sleep(RECONNECT_DELAY)
 
 
@@ -896,15 +624,6 @@ async def stream_video(cam: CameraCapture,
 async def stream_detection(result_queue: DetectionResult,
                             shared_state: SharedState,
                             loop: asyncio.AbstractEventLoop):
-    """
-    Gửi JSON detection result lên ws://.../ws/detection/{CAMERA_ID}.
-
-    Encode thumbnail tại đây (tách khỏi inference loop):
-      1. Nhận payload từ result_queue (không có thumb_b64)
-      2. Lấy frame gốc từ shared_state.snapshot()
-      3. Gọi render_and_encode_thumb() qua run_in_executor()
-      4. Thêm thumb_b64 vào payload rồi gửi
-    """
     while True:
         try:
             async with websockets.connect(WS_DETECTION_URL) as ws:
@@ -915,24 +634,17 @@ async def stream_detection(result_queue: DetectionResult,
                     snap = shared_state.snapshot()
                     if snap is not None:
                         thumb_b64 = await loop.run_in_executor(
-                            None,
-                            render_and_encode_thumb,
-                            snap['raw_frame'],
+                            None, render_and_encode_thumb, snap['raw_frame']
                         )
                         payload['thumb_b64'] = thumb_b64
                     else:
                         payload['thumb_b64'] = ''
 
                     await ws.send(json.dumps(payload, ensure_ascii=False))
-
         except websockets.exceptions.ConnectionClosed:
-            logger.warning(
-                f"[Detection] Mất kết nối, thử lại sau {RECONNECT_DELAY}s …"
-            )
+            logger.warning(f"[Detection] Mất kết nối, thử lại sau {RECONNECT_DELAY}s …")
         except Exception as e:
-            logger.error(
-                f"[Detection] Lỗi: {e}, thử lại sau {RECONNECT_DELAY}s …"
-            )
+            logger.error(f"[Detection] Lỗi: {e}, thử lại sau {RECONNECT_DELAY}s …")
         await asyncio.sleep(RECONNECT_DELAY)
 
 
@@ -942,7 +654,7 @@ async def stream_detection(result_queue: DetectionResult,
 
 async def main():
     start_time = time.time()
-    loop       = asyncio.get_event_loop()   # Python 3.6 compatible
+    loop       = asyncio.get_event_loop()
 
     buzzer = BuzzerController()
     buzzer.start()
@@ -977,26 +689,23 @@ async def main():
     infer_thread.start()
     logger.info("[Main] Inference thread đã khởi động.")
 
-    print("=" * 62)
+    print("=" * 60)
     print("  Jetson Violence Detection Client  [v4]")
-    print(f"  Camera index       : {cam.camera_id}")
-    print(f"  Stream URL         : {WS_STREAM_URL}")
-    print(f"  Detection URL      : {WS_DETECTION_URL}")
-    print(f"  Stream FPS         : {STREAM_FPS}")
-    print(f"  Infer rate         : mỗi {INFER_INTERVAL_MS}ms (~{1000 // INFER_INTERVAL_MS}/s)")
-    print(f"  Binding mapping    : TỰ ĐỘNG — không hard-code tên")
-    print(f"  Sliding window     : TẮT — MoViNet Stream tự quản lý context")
-    print(f"  EMA alpha          : {EMA_ALPHA}")
-    print(f"  Spike boost        : x{SPIKE_BOOST} khi delta > {SPIKE_THRESH}")
-    print(f"  Threshold          : {THRESHOLD}  (áp lên smooth prob)")
-    print(f"  Confirm            : {CONFIRM_FRAMES} lần liên tiếp")
-    print(f"  Cooldown           : {COOLDOWN_SEC}s")
-    print(f"  ── Buzzer ──────────────────────────────────────")
-    print(f"  GPIO PIN           : {BUZZER_PIN}  (BOARD)")
-    print(f"  Kích hoạt sau      : {VIOLENCE_BUZZER_DELAY}s bạo lực liên tục")
-    print(f"  Beep ON / OFF      : {BUZZER_BEEP_ON_SEC}s / {BUZZER_BEEP_OFF_SEC}s")
-    print(f"  GPIO khả dụng      : {GPIO_AVAILABLE}")
-    print("=" * 62)
+    print(f"  Camera index   : {cam.camera_id}")
+    print(f"  Stream URL     : {WS_STREAM_URL}")
+    print(f"  Detection URL  : {WS_DETECTION_URL}")
+    print(f"  Stream FPS     : {STREAM_FPS}")
+    print(f"  Infer rate     : mỗi {INFER_INTERVAL_MS}ms (~{1000 // INFER_INTERVAL_MS}/s)")
+    print(f"  EMA alpha      : {EMA_ALPHA}")
+    print(f"  Spike boost    : x{SPIKE_BOOST} khi delta > {SPIKE_THRESH}")
+    print(f"  Threshold      : {THRESHOLD}")
+    print(f"  Confirm        : {CONFIRM_FRAMES} frames liên tiếp")
+    print(f"  Cooldown       : {COOLDOWN_SEC}s")
+    print(f"  GPIO PIN       : {BUZZER_PIN}  (BOARD)")
+    print(f"  Buzzer delay   : {VIOLENCE_BUZZER_DELAY}s bạo lực liên tục")
+    print(f"  Beep ON / OFF  : {BUZZER_BEEP_ON_SEC}s / {BUZZER_BEEP_OFF_SEC}s")
+    print(f"  GPIO available : {GPIO_AVAILABLE}")
+    print("=" * 60)
 
     try:
         await asyncio.gather(
