@@ -1,9 +1,5 @@
 """
-<<<<<<< HEAD
 Bản cũ
-=======
-movinet_jetson_client_v2.py
->>>>>>> 135acf84f8c5baed0b813739546fdc275102a931
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 Cập nhật: khi bạo lực liên tục ≥ VIOLENCE_BUZZER_DELAY giây,
