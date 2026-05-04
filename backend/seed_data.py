@@ -46,6 +46,9 @@ def seed_data():
         db.commit()
         print(f"✓ Added {len(users)} users")
         
+        # Lưu UserID để sử dụng cho cameras
+        user_ids = [user.UserID for user in users]
+        
         print("\n--- Seeding Cameras ---")
         cameras = [
             Camera(
@@ -53,52 +56,63 @@ def seed_data():
                 CameraName="Camera Main Hall",
                 CameraIP="192.168.137.2",
                 CameraPhoneNum="0901234567",
-                CameraStatus=True
+                CameraStatus=True,
+                UserID=user_ids[0]
             ),
             Camera(
                 CameraID="jetson-cam-02",
                 CameraName="Camera Lobby",
                 CameraIP="192.168.137.2",
                 CameraPhoneNum="0901234568",
-                CameraStatus=True
+                CameraStatus=True,
+                UserID=user_ids[1]
             ),
             Camera(
                 CameraID="jetson-cam-03",
                 CameraName="Camera Parking",
                 CameraIP="192.168.137.2",
                 CameraPhoneNum="0901234569",
-                CameraStatus=False
+                CameraStatus=False,
+                UserID=user_ids[2]
             ),
             Camera(
                 CameraID="jetson-cam-04",
                 CameraName="Camera Entrance",
                 CameraIP="192.168.137.2",
                 CameraPhoneNum="0901234570",
-                CameraStatus=True
+                CameraStatus=True,
+                UserID=user_ids[0]
             )
         ]
         db.add_all(cameras)
         db.commit()
         print(f"✓ Added {len(cameras)} cameras")
         
+        # Lưu CameraID để sử dụng cho calls và violence history
+        camera_ids = [camera.CameraID for camera in cameras]
+        
         print("\n--- Seeding Calls ---")
         now = datetime.now()
         calls = [
             Call(
                 CallID=str(uuid.uuid4()),
-                CallDate=now - timedelta(days=2, hours=5)
+                CallDate=now - timedelta(days=2, hours=5),
+                CameraID=camera_ids[0]
             ),
             Call(
                 CallID=str(uuid.uuid4()),
-                CallDate=now - timedelta(days=1, hours=3, minutes=30)
+                CallDate=now - timedelta(days=1, hours=3, minutes=30),
+                CameraID=camera_ids[1]
             ),
             Call(
                 CallID=str(uuid.uuid4()),
-                CallDate=now - timedelta(hours=12)
+                CallDate=now - timedelta(hours=12),
+                CameraID=camera_ids[2]
             ),
             Call(
                 CallID=str(uuid.uuid4()),
-                CallDate=now - timedelta(hours=2)
+                CallDate=now - timedelta(hours=2),
+                CameraID=camera_ids[3]
             )
         ]
         db.add_all(calls)
@@ -112,35 +126,40 @@ def seed_data():
                 Timestamp=now - timedelta(days=2, hours=5, minutes=15),
                 Location="Main Hall",
                 ClipURL="https://storage.example.com/clips/violence_001.mp4",
-                Confidence=0.92
+                Confidence=0.92,
+                CameraID=camera_ids[0]
             ),
             ViolenceHistory(
                 HistoryID=str(uuid.uuid4()),
                 Timestamp=now - timedelta(days=1, hours=3, minutes=45),
                 Location="Lobby",
                 ClipURL="https://storage.example.com/clips/violence_002.mp4",
-                Confidence=0.87
+                Confidence=0.87,
+                CameraID=camera_ids[1]
             ),
             ViolenceHistory(
                 HistoryID=str(uuid.uuid4()),
                 Timestamp=now - timedelta(hours=12, minutes=20),
                 Location="Entrance",
                 ClipURL="https://storage.example.com/clips/violence_003.mp4",
-                Confidence=0.95
+                Confidence=0.95,
+                CameraID=camera_ids[3]
             ),
             ViolenceHistory(
                 HistoryID=str(uuid.uuid4()),
                 Timestamp=now - timedelta(hours=2, minutes=5),
                 Location="Parking",
                 ClipURL="https://storage.example.com/clips/violence_004.mp4",
-                Confidence=0.78
+                Confidence=0.78,
+                CameraID=camera_ids[2]
             ),
             ViolenceHistory(
                 HistoryID=str(uuid.uuid4()),
                 Timestamp=now - timedelta(hours=1),
                 Location="Main Hall",
                 ClipURL="https://storage.example.com/clips/violence_005.mp4",
-                Confidence=0.88
+                Confidence=0.88,
+                CameraID=camera_ids[0]
             )
         ]
         db.add_all(violence_records)
