@@ -13,6 +13,9 @@ function Header() {
   const handleDetectionHistoryClick = () => {
     navigate('/detection-history');
   };
+  const handleVideoAnalysisClick = () => {
+    navigate('/video-analysis');
+  };
 
   const handleLogoClick = () => {
     navigate('/');
@@ -21,6 +24,7 @@ function Header() {
   const isCameraActive = location.pathname === '/camera';
   const isNotificationHistoryActive = location.pathname === '/notification-history';
   const isDetectionHistoryActive = location.pathname === '/detection-history';
+  const isVideoAnalysisActive = location.pathname === '/video-analysis';
 
   return (
     <header className="topbar">
@@ -36,6 +40,13 @@ function Header() {
             onClick={handleCameraClick}
           >
             Camera
+          </button>
+          <button
+            className={`nav-link ${isVideoAnalysisActive ? 'active' : ''}`}
+            type="button"
+            onClick={handleVideoAnalysisClick}
+          >
+            Phân tích video
           </button>
           <button
             className={`nav-link ${isNotificationHistoryActive ? 'active' : ''}`}   

@@ -4,6 +4,7 @@ import HomePage from './pages/HomePage';
 import CameraPage from './pages/CameraPage';
 import NotificationHistoryPage from './pages/NotificationHistoryPage';
 import DetectionHistoryPage from './pages/DetectionHistoryPage';
+import VideoAnalysisPage from './pages/VideoAnalysisPage';
 
 function App() {
   return (
@@ -14,6 +15,7 @@ function App() {
         <Route path="/camera" element={<CameraPage />} />
         <Route path="/notification-history" element={<NotificationHistoryPage />} />
         <Route path="/detection-history" element={<DetectionHistoryPage />} />
+        <Route path="/video-analysis" element={<VideoAnalysisPage />} />
       </Routes>
     </>
   );
