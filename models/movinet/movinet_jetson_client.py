@@ -1,7 +1,12 @@
 
 """
-movinet_jetson_client_v2.py
+Bản cũ
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Cập nhật: khi bạo lực liên tục ≥ VIOLENCE_BUZZER_DELAY giây,
+đồng thời:
+  1. Kêu còi (Buzzer) GPIO PIN 12
+  2. Gọi điện thoại số PHONE_NUMBER qua SIM module (ATD command)
 
 Luồng hoạt động:
   ┌─────────────────────────────────────┐
@@ -19,9 +24,11 @@ Luồng hoạt động:
   ws://.../ws/stream/   ws://.../ws/detection/
   {CAMERA_ID}           {CAMERA_ID}
                          │
-                         ▼
-                   BuzzerController (thread)
-                   GPIO PIN 12 — kêu khi bạo lực ≥ 5s
+                    ┌────┴────┐
+                    ▼         ▼
+             BuzzerController  PhoneDialer
+             GPIO PIN 12        SIM module
+             beep khi bạo lực   ATD...;
 
 Thay đổi so với v1:
   [1] Tách Inference ↔ Rendering:
@@ -37,6 +44,9 @@ Thay đổi so với v1:
       - run_inference() dùng frame_event.wait(timeout=0.1) ở đầu loop
         thay vì time.sleep() ở cuối, rồi frame_event.clear() sau khi
         lấy frame xong → không bỏ sót frame, không bận-chờ
+  [3] PhoneDialer:
+      - Gọi điện qua SIM module khi bạo lực ≥ VIOLENCE_BUZZER_DELAY giây
+      - Cúp máy + tắt còi ngay khi về Normal
 
 JSON detection payload (gửi mỗi lần infer):
 {
@@ -52,6 +62,7 @@ JSON detection payload (gửi mỗi lần infer):
   "window_countdown":  1.3,
   "violence_duration": 3.7,   // giây bạo lực liên tục (0 nếu Normal)
   "buzzer_active":     false,  // còi đang kêu hay không
+  "phone_calling":     false,  // đang gọi điện hay không
   "thumb_b64":         "<base64 jpeg 120x68>"
 }
 
@@ -62,6 +73,7 @@ import cv2
 import numpy as np
 import tensorrt as trt
 import pycuda.driver as cuda
+import serial
 from typing import Optional
 import threading
 import asyncio
@@ -130,9 +142,17 @@ THUMB_HEIGHT      = 68
 
 # ── Buzzer (GPIO) ─────────────────────────────────────────
 BUZZER_PIN              = 12    # Chân vật lý BOARD
-VIOLENCE_BUZZER_DELAY   = 5.0   # Giây bạo lực liên tục trước khi kêu còi
+VIOLENCE_BUZZER_DELAY   = 5.0   # Giây bạo lực liên tục trước khi kêu còi + gọi điện
 BUZZER_BEEP_ON_SEC      = 0.5   # Thời gian còi kêu mỗi tiếng beep
 BUZZER_BEEP_OFF_SEC     = 0.3   # Khoảng nghỉ giữa các tiếng beep
+
+# ── Phone (SIM module AT command) ────────────────────────
+PHONE_NUMBER        = "0766590137"
+PHONE_SERIAL_PORT   = "/dev/ttyUSB2"   # Đổi thành ttyUSB1 nếu cần
+PHONE_BAUD_RATE     = 115200
+PHONE_CALL_TIMEOUT  = 30               # Giây duy trì cuộc gọi rồi tự cúp
+PHONE_RETRY_DELAY   = 60               # Giây cooldown giữa 2 lần gọi
+PHONE_RING_WAIT     = 5                # Giây chờ sau ATD trước khi duy trì cuộc gọi
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -195,7 +215,7 @@ TRT_LOGGER  = trt.Logger(trt.Logger.WARNING)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  SHARED STATE  [THÊM MỚI]
+#  SHARED STATE
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class SharedState:
@@ -218,11 +238,11 @@ class SharedState:
     """
 
     def __init__(self):
-        self._lock       = threading.Lock()
-        self._raw_frame  = None
-        self._prob_raw   = 0.0
+        self._lock        = threading.Lock()
+        self._raw_frame   = None
+        self._prob_raw    = 0.0
         self._prob_smooth = 0.0
-        self._label      = 'Normal'
+        self._label       = 'Normal'
 
     def update(self,
                raw_frame: np.ndarray,
@@ -231,8 +251,6 @@ class SharedState:
                label: str) -> None:
         """Ghi kết quả mới nhất (gọi từ inference thread)."""
         with self._lock:
-            # Lưu bản copy để tránh race condition khi caller tiếp tục
-            # dùng frame cho lần infer kế tiếp
             self._raw_frame   = raw_frame.copy()
             self._prob_raw    = prob_raw
             self._prob_smooth = prob_smooth
@@ -248,7 +266,7 @@ class SharedState:
             if self._raw_frame is None:
                 return None
             return {
-                'raw_frame':   self._raw_frame,   # numpy array, caller KHÔNG sửa
+                'raw_frame':   self._raw_frame,
                 'prob_raw':    self._prob_raw,
                 'prob_smooth': self._prob_smooth,
                 'label':       self._label,
@@ -257,7 +275,7 @@ class SharedState:
 
 def render_and_encode_thumb(raw_frame: np.ndarray) -> str:
     """
-    [THÊM MỚI] Tách khỏi inference loop.
+    Tách khỏi inference loop.
 
     Nhận frame gốc BGR numpy, thu nhỏ thành thumbnail và
     trả về chuỗi base64 JPEG. Hàm này được gọi từ
@@ -301,8 +319,6 @@ class BuzzerController(threading.Thread):
         else:
             logger.warning("[Buzzer] Chạy ở chế độ giả lập (không có GPIO).")
 
-    # ── public API ───────────────────────────────────────
-
     def activate(self):
         """Yêu cầu còi bắt đầu kêu (gọi được từ bất kỳ thread nào)."""
         with self._cond:
@@ -331,8 +347,6 @@ class BuzzerController(threading.Thread):
         with self._lock:
             return self._active
 
-    # ── thread body ──────────────────────────────────────
-
     def run(self):
         try:
             while True:
@@ -355,8 +369,6 @@ class BuzzerController(threading.Thread):
                 GPIO.cleanup()
                 logger.info("[Buzzer] GPIO cleanup xong.")
 
-    # ── helpers ──────────────────────────────────────────
-
     def _set_gpio(self, state: bool):
         if self.available:
             GPIO.output(BUZZER_PIN, GPIO.LOW if state else GPIO.HIGH)
@@ -376,13 +388,171 @@ class BuzzerController(threading.Thread):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  PHONE DIALER  (SIM module AT command)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+class PhoneDialer(threading.Thread):
+    """
+    Thread quản lý gọi điện thoại qua SIM module.
+
+    Cách dùng:
+        dialer = PhoneDialer()
+        dialer.start()
+        dialer.request_call()   # trigger gọi khi bạo lực ≥ ngưỡng
+        dialer.cancel_call()    # cúp máy khi về Normal
+        dialer.stop()           # dừng thread
+    """
+
+    _STATE_IDLE    = "IDLE"
+    _STATE_CALLING = "CALLING"
+
+    def __init__(self):
+        super().__init__(daemon=True, name="PhoneDialerThread")
+        self._lock          = threading.Lock()
+        self._cond          = threading.Condition(self._lock)
+        self._running       = True
+        self._requested     = False
+        self._cancel        = False
+        self._state         = self._STATE_IDLE
+        self._serial        = None
+        self.available      = False
+        self._last_call_end = 0.0
+
+        self._open_serial()
+
+    # ── Serial helpers ───────────────────────────────────
+
+    def _open_serial(self):
+        try:
+            self._serial = serial.Serial(
+                PHONE_SERIAL_PORT, baudrate=PHONE_BAUD_RATE, timeout=3)
+            time.sleep(0.5)
+            resp = self._send_at("AT")
+            if "OK" in resp:
+                self.available = True
+                logger.info(
+                    f"[Phone] SIM module sẵn sàng — {PHONE_SERIAL_PORT} "
+                    f"@ {PHONE_BAUD_RATE} baud.")
+            else:
+                logger.warning(f"[Phone] SIM không phản hồi AT: {resp!r}")
+        except Exception as e:
+            logger.warning(f"[Phone] Không mở được {PHONE_SERIAL_PORT}: {e}")
+            logger.warning("[Phone] Chạy ở chế độ giả lập (không có SIM module).")
+
+    def _send_at(self, cmd: str, wait: float = 1.0) -> str:
+        if self._serial is None or not self._serial.is_open:
+            return ""
+        try:
+            self._serial.reset_input_buffer()
+            self._serial.write((cmd + "\r\n").encode())
+            time.sleep(wait)
+            resp = self._serial.read_all().decode(errors="ignore")
+            logger.debug(f"[Phone] >> {cmd!r}  << {resp.strip()!r}")
+            return resp
+        except Exception as e:
+            logger.error(f"[Phone] Lỗi AT '{cmd}': {e}")
+            return ""
+
+    # ── Public API ───────────────────────────────────────
+
+    def request_call(self):
+        """Yêu cầu gọi điện — bỏ qua nếu đang gọi hoặc trong cooldown."""
+        with self._cond:
+            if self._state != self._STATE_IDLE:
+                return
+            now = time.time()
+            cooldown_ok = (self._last_call_end == 0.0 or
+                           now - self._last_call_end >= PHONE_RETRY_DELAY)
+            if cooldown_ok:
+                self._requested = True
+                self._cond.notify_all()
+                logger.warning(f"[Phone] ☎  YÊU CẦU GỌI {PHONE_NUMBER}!")
+            else:
+                remain = PHONE_RETRY_DELAY - (now - self._last_call_end)
+                logger.debug(f"[Phone] Cooldown còn {remain:.0f}s — bỏ qua.")
+
+    def cancel_call(self):
+        """Cúp máy ngay (khi về Normal)."""
+        with self._cond:
+            if self._state == self._STATE_CALLING:
+                self._cancel = True
+                self._cond.notify_all()
+                logger.info("[Phone] Yêu cầu cúp máy (về Normal).")
+
+    def stop(self):
+        """Dừng thread, cúp máy nếu đang gọi, đóng serial."""
+        with self._cond:
+            self._running   = False
+            self._cancel    = True
+            self._requested = False
+            self._cond.notify_all()
+
+    @property
+    def is_calling(self) -> bool:
+        with self._lock:
+            return self._state == self._STATE_CALLING
+
+    # ── Thread body ──────────────────────────────────────
+
+    def run(self):
+        try:
+            while True:
+                with self._cond:
+                    while not self._requested and self._running:
+                        self._cond.wait(timeout=1.0)
+                    if not self._running:
+                        break
+                    self._requested = False
+                    self._state     = self._STATE_CALLING
+                    self._cancel    = False
+                self._do_call()
+        except Exception as e:
+            logger.exception(f"[Phone] Lỗi thread: {e}")
+        finally:
+            self._hangup()
+            if self._serial and self._serial.is_open:
+                self._serial.close()
+            logger.info("[Phone] Thread dừng, serial đóng.")
+
+    def _do_call(self):
+        logger.warning(f"[Phone] ☎  Đang quay số {PHONE_NUMBER} …")
+        if self.available:
+            self._send_at("ATE0")                        # tắt echo
+            self._send_at(f"ATD{PHONE_NUMBER};",         # quay số
+                          wait=PHONE_RING_WAIT)
+        else:
+            logger.warning(f"[Phone][SIM] GIẢ LẬP: ATD{PHONE_NUMBER};")
+
+        # Duy trì cuộc gọi hoặc đến khi bị cancel / dừng
+        deadline = time.time() + PHONE_CALL_TIMEOUT
+        while time.time() < deadline:
+            with self._cond:
+                if self._cancel or not self._running:
+                    break
+                self._cond.wait(timeout=min(deadline - time.time(), 0.2))
+
+        self._hangup()
+        with self._lock:
+            self._last_call_end = time.time()
+            self._cancel        = False
+            self._state         = self._STATE_IDLE
+        logger.info("[Phone] Cuộc gọi kết thúc.")
+
+    def _hangup(self):
+        if self.available:
+            self._send_at("ATH", wait=0.5)
+            logger.info("[Phone] ATH — Cúp máy.")
+        else:
+            logger.debug("[Phone][SIM] GIẢ LẬP: ATH")
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  CAMERA CAPTURE THREAD
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class CameraCapture(threading.Thread):
     def __init__(self, frame_event: threading.Event):
         super().__init__(daemon=True)
-        # [THÊM] Nhận frame_event từ ngoài để signal inference thread
         self._frame_event = frame_event
         self._frame       = None
         self._lock        = threading.Lock()
@@ -434,7 +604,6 @@ class CameraCapture(threading.Thread):
             if ret:
                 with self._lock:
                     self._frame = frame
-                # [THÊM] Thông báo cho inference thread có frame mới
                 self._frame_event.set()
 
         cap.release()
@@ -536,7 +705,7 @@ class DetectionResult:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  INFERENCE THREAD  [CẬP NHẬT]
+#  INFERENCE THREAD
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def run_inference(cam: CameraCapture,
@@ -544,6 +713,7 @@ def run_inference(cam: CameraCapture,
                   shared_state: SharedState,
                   result_queue: DetectionResult,
                   buzzer: BuzzerController,
+                  dialer: PhoneDialer,
                   start_time: float):
     """
     Inference loop — chỉ thực hiện:
@@ -554,6 +724,10 @@ def run_inference(cam: CameraCapture,
 
     Thumbnail encode (cv2.imencode) được thực hiện bởi
     stream_detection() thông qua render_and_encode_thumb().
+
+    Buzzer + Phone logic:
+      - Kêu còi và gọi điện khi bạo lực ≥ VIOLENCE_BUZZER_DELAY giây.
+      - Cúp máy + tắt còi ngay khi về Normal.
     """
     cuda.init()
     cuda_ctx = cuda.Device(0).make_context()
@@ -562,7 +736,6 @@ def run_inference(cam: CameraCapture,
     model = MoViNetTRT(ENGINE_PATH, cuda_ctx)
 
     logger.info("[Inference] Chờ frame đầu tiên …")
-    # Chờ frame đầu tiên bằng event thay vì vòng lặp polling
     got_first = frame_event.wait(timeout=30.0)
     if not got_first:
         logger.error("[Inference] Timeout: không nhận được frame sau 30s!")
@@ -572,26 +745,24 @@ def run_inference(cam: CameraCapture,
 
     logger.info("[Inference] Đã nhận frame — bắt đầu inference.")
 
-    prob_smooth        = 0.0
-    prev_prob_raw      = 0.0
-    confirm_count      = 0
-    violence_until     = 0.0
-    window_start       = time.time()
+    prob_smooth         = 0.0
+    prev_prob_raw       = 0.0
+    confirm_count       = 0
+    violence_until      = 0.0
+    window_start        = time.time()
     violence_start_time = None
+    alert_triggered     = False   # đã trigger gọi điện trong đợt này chưa
 
-    cam_times   = deque(maxlen=60)
-    infer_times = deque(maxlen=30)
+    cam_times     = deque(maxlen=60)
+    infer_times   = deque(maxlen=30)
     last_infer_ms = 0.0
 
     try:
         while True:
-            # ── [THÊM] Event-based wait — không busy-poll ────────
-            # Chờ CameraCapture báo có frame mới (timeout để tránh
-            # treo mãi nếu camera ngắt kết nối)
+            # ── Event-based wait — không busy-poll ───────────────
             frame_event.wait(timeout=0.1)
-            # Lấy frame và reset event ngay sau đó
             frame = cam.get_latest()
-            frame_event.clear()  # reset để chờ frame kế tiếp
+            frame_event.clear()
 
             if frame is None:
                 continue
@@ -605,18 +776,17 @@ def run_inference(cam: CameraCapture,
                 model.cuda_ctx.push()
                 model.reset_states()
                 model.cuda_ctx.pop()
-                prob_smooth        = 0.0
-                prev_prob_raw      = 0.0
-                confirm_count      = 0
-                window_start       = now
-                elapsed_window     = 0.0
+                prob_smooth    = 0.0
+                prev_prob_raw  = 0.0
+                confirm_count  = 0
+                window_start   = now
+                elapsed_window = 0.0
                 logger.info(f"[Window] Reset @ {time.strftime('%H:%M:%S')}")
 
             countdown = WINDOW_SEC - elapsed_window
 
             # ── Time-based inference throttle ────────────────────
             if (now_ms - last_infer_ms) < INFER_INTERVAL_MS:
-                # Frame đến quá sớm — bỏ qua, chờ frame tiếp theo
                 continue
 
             t0 = time.time()
@@ -645,39 +815,45 @@ def run_inference(cam: CameraCapture,
 
             label = 'VIOLENCE' if now < violence_until else 'Normal'
 
-            # ── [THÊM] Lưu frame gốc + kết quả vào SharedState ──
-            # Không encode JPEG ở đây — render_and_encode_thumb()
-            # sẽ được gọi từ stream_detection() khi cần gửi payload
+            # ── Lưu frame gốc + kết quả vào SharedState ──────────
             shared_state.update(frame, prob_raw, prob_smooth, label)
 
-            # ── Buzzer logic ──────────────────────────────────────
+            # ── Buzzer + Phone logic ──────────────────────────────
             if label == 'VIOLENCE':
                 if violence_start_time is None:
                     violence_start_time = now
-                    logger.info("[Buzzer] Bắt đầu theo dõi thời gian bạo lực …")
+                    alert_triggered     = False
+                    logger.info("[Alert] Bắt đầu theo dõi thời gian bạo lực …")
 
                 violence_duration = now - violence_start_time
 
                 if violence_duration >= VIOLENCE_BUZZER_DELAY:
+                    # Kích hoạt còi liên tục
                     buzzer.activate()
+                    # Gọi điện một lần (PhoneDialer tự quản cooldown)
+                    if not alert_triggered:
+                        dialer.request_call()
+                        alert_triggered = True
                 else:
                     remaining_to_alarm = VIOLENCE_BUZZER_DELAY - violence_duration
                     logger.debug(
-                        f"[Buzzer] Bạo lực {violence_duration:.1f}s "
+                        f"[Alert] Bạo lực {violence_duration:.1f}s "
                         f"/ {VIOLENCE_BUZZER_DELAY}s "
                         f"(còn {remaining_to_alarm:.1f}s nữa)"
                     )
             else:
+                # Về Normal → reset đếm + tắt còi + cúp máy
                 if violence_start_time is not None:
                     elapsed = now - violence_start_time
                     logger.info(
-                        f"[Buzzer] Kết thúc bạo lực sau {elapsed:.1f}s — reset."
-                    )
+                        f"[Alert] Kết thúc bạo lực sau {elapsed:.1f}s — reset.")
                     violence_start_time = None
+                    alert_triggered     = False
                 buzzer.deactivate()
+                dialer.cancel_call()
                 violence_duration = 0.0
 
-            # FPS
+            # ── FPS ──────────────────────────────────────────────
             infer_fps = (len(infer_times) - 1) / (infer_times[-1] - infer_times[0]) \
                         if len(infer_times) > 1 else 0.0
             cam_times.append(now)
@@ -686,8 +862,7 @@ def run_inference(cam: CameraCapture,
 
             ts_str = time.strftime('%H:%M:%S') + f'.{int((now % 1)*1000):03d}'
 
-            # ── Payload KHÔNG chứa thumb_b64 ─────────────────────
-            # thumb_b64 sẽ được thêm bởi stream_detection() khi encode
+            # ── Payload (thumb_b64 được thêm bởi stream_detection) ─
             payload = {
                 "camera_id":         CAMERA_ID,
                 "timestamp":         ts_str,
@@ -705,6 +880,7 @@ def run_inference(cam: CameraCapture,
                 "infer_ms":          round((t1 - t0) * 1000,  1),
                 "violence_duration": round(violence_duration,  2),
                 "buzzer_active":     buzzer.is_active,
+                "phone_calling":     dialer.is_calling,
                 # thumb_b64 được thêm sau bởi stream_detection()
             }
 
@@ -715,16 +891,15 @@ def run_inference(cam: CameraCapture,
                 f"confirm={confirm_count}/{CONFIRM_FRAMES}  → {label}  "
                 f"dur={violence_duration:.1f}s  "
                 f"buzzer={'ON' if buzzer.is_active else 'off'}  "
+                f"phone={'CALLING' if dialer.is_calling else 'idle'}  "
                 f"({(t1-t0)*1000:.0f}ms)"
             )
-
-            # Không có time.sleep() ở đây — event-based wait ở đầu loop
-            # đảm nhiệm việc nhường CPU
 
     except Exception as e:
         logger.exception(f"[Inference] Lỗi: {e}")
     finally:
         buzzer.deactivate()
+        dialer.cancel_call()
         cuda_ctx.pop()
         cuda_ctx.detach()
 
@@ -763,7 +938,7 @@ async def stream_video(cam: CameraCapture):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  ASYNC TASK 2 — GỬI KẾT QUẢ DETECTION  [CẬP NHẬT]
+#  ASYNC TASK 2 — GỬI KẾT QUẢ DETECTION
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 async def stream_detection(result_queue: DetectionResult,
@@ -771,7 +946,7 @@ async def stream_detection(result_queue: DetectionResult,
     """
     Gửi JSON detection result lên ws://.../ws/detection/{CAMERA_ID}.
 
-    [THÊM] Encode thumbnail tại đây (tách khỏi inference loop):
+    Encode thumbnail tại đây (tách khỏi inference loop):
       - Lấy payload từ result_queue (không có thumb_b64)
       - Lấy frame gốc từ shared_state.snapshot()
       - Gọi render_and_encode_thumb() để encode JPEG
@@ -784,10 +959,8 @@ async def stream_detection(result_queue: DetectionResult,
                 while True:
                     payload = await result_queue.get_new()
 
-                    # Encode thumbnail ở đây, KHÔNG trong inference thread
                     snap = shared_state.snapshot()
                     if snap is not None:
-                        # Chạy encode trong executor để không block event loop
                         loop = asyncio.get_event_loop()
                         thumb_b64 = await loop.run_in_executor(
                             None,
@@ -818,12 +991,16 @@ async def main():
     buzzer = BuzzerController()
     buzzer.start()
 
-    # ── [THÊM] Tạo frame_event và shared_state ───────────
+    # ── Khởi động PhoneDialer ─────────────────────────────
+    dialer = PhoneDialer()
+    dialer.start()
+
+    # ── Tạo frame_event và shared_state ──────────────────
     frame_event  = threading.Event()
     shared_state = SharedState()
 
     # ── Khởi động camera ─────────────────────────────────
-    cam = CameraCapture(frame_event)   # truyền frame_event vào camera
+    cam = CameraCapture(frame_event)
     cam.start()
     logger.info("[Main] Chờ camera kết nối …")
 
@@ -835,6 +1012,7 @@ async def main():
     if not cam.connected:
         logger.error(f"[Main] Không thể kết nối camera: {cam.error_msg}")
         buzzer.stop()
+        dialer.stop()
         return
 
     logger.info(f"[Main] Camera sẵn sàng — index={cam.camera_id}")
@@ -846,7 +1024,7 @@ async def main():
     # ── Khởi động inference thread ────────────────────────
     infer_thread = threading.Thread(
         target=run_inference,
-        args=(cam, frame_event, shared_state, result_queue, buzzer, start_time),
+        args=(cam, frame_event, shared_state, result_queue, buzzer, dialer, start_time),
         daemon=True,
     )
     infer_thread.start()
@@ -854,7 +1032,7 @@ async def main():
 
     # ── In thông tin cấu hình ─────────────────────────────
     print("=" * 60)
-    print("  Jetson Violence Detection Client  [v2]")
+    print("  Jetson Violence Detection Client  [MoViNet v2]")
     print(f"  Camera index       : {cam.camera_id}")
     print(f"  Stream URL         : {WS_STREAM_URL}")
     print(f"  Detection URL      : {WS_DETECTION_URL}")
@@ -870,15 +1048,22 @@ async def main():
     print(f"  Kích hoạt sau      : {VIOLENCE_BUZZER_DELAY}s bạo lực liên tục")
     print(f"  Beep ON / OFF      : {BUZZER_BEEP_ON_SEC}s / {BUZZER_BEEP_OFF_SEC}s")
     print(f"  GPIO khả dụng      : {GPIO_AVAILABLE}")
+    print(f"  ── Phone ──────────────────────────────────")
+    print(f"  Số điện thoại      : {PHONE_NUMBER}")
+    print(f"  Serial port        : {PHONE_SERIAL_PORT}  @ {PHONE_BAUD_RATE} baud")
+    print(f"  SIM khả dụng       : {dialer.available}")
+    print(f"  Thời gian gọi      : {PHONE_CALL_TIMEOUT}s rồi tự cúp")
+    print(f"  Cooldown gọi lại   : {PHONE_RETRY_DELAY}s")
     print("=" * 60)
 
     try:
         await asyncio.gather(
             stream_video(cam),
-            stream_detection(result_queue, shared_state),  # truyền shared_state
+            stream_detection(result_queue, shared_state),
         )
     finally:
         buzzer.stop()
+        dialer.stop()
 
 
 if __name__ == "__main__":

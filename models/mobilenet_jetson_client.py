@@ -1,8 +1,33 @@
-# Cập nhật từ v4: khi bạo lực liên tục ≥ VIOLENCE_BUZZER_DELAY giây,
-# đồng thời:
-#   1. Kêu còi (Buzzer) GPIO PIN 12
-#   2. Gọi điện thoại số PHONE_NUMBER qua SIM module (ATD command)
-
+# mobilenet_jetson_client_v6.py
+#
+# Cập nhật từ v5:
+#   - MODEL THAY ĐỔI: từ Offline TSM (16-frame batch) → Online TSM (1-frame streaming)
+#     * Tên engine: mobilenetv4.engine  (thay vì mobilenetv2_tsm_16frames.engine)
+#     * Input:  'input' (1,3,172,172) + 17 state buffers  buffer_0..buffer_16
+#     * Output: 'output' (1,2)        + 17 new_buffer_0..new_buffer_16
+#     * Không cần frame_buffer/deque NUM_FRAMES nữa — infer từng frame một
+#   - MobileNetTRT được viết lại hoàn toàn để quản lý buffers liên tục
+#   - NUM_FRAMES config vẫn giữ lại cho phần logging/payload (giá trị = 1)
+#
+# Buffer shapes (float32):
+#   buffer_0  : (1, 4,  86, 86)    new_buffer_0  : (1, 4,  86, 86)
+#   buffer_1  : (1, 2,  86, 86)    new_buffer_1  : (1, 2,  86, 86)
+#   buffer_2  : (1, 3,  43, 43)    new_buffer_2  : (1, 3,  43, 43)
+#   buffer_3  : (1, 3,  43, 43)    new_buffer_3  : (1, 3,  43, 43)
+#   buffer_4  : (1, 4,  22, 22)    new_buffer_4  : (1, 4,  22, 22)
+#   buffer_5  : (1, 4,  22, 22)    new_buffer_5  : (1, 4,  22, 22)
+#   buffer_6  : (1, 4,  22, 22)    new_buffer_6  : (1, 4,  22, 22)
+#   buffer_7  : (1, 8,  11, 11)    new_buffer_7  : (1, 8,  11, 11)
+#   buffer_8  : (1, 8,  11, 11)    new_buffer_8  : (1, 8,  11, 11)
+#   buffer_9  : (1, 8,  11, 11)    new_buffer_9  : (1, 8,  11, 11)
+#   buffer_10 : (1, 8,  11, 11)    new_buffer_10 : (1, 8,  11, 11)
+#   buffer_11 : (1, 12, 11, 11)    new_buffer_11 : (1, 12, 11, 11)
+#   buffer_12 : (1, 12, 11, 11)    new_buffer_12 : (1, 12, 11, 11)
+#   buffer_13 : (1, 12, 11, 11)    new_buffer_13 : (1, 12, 11, 11)
+#   buffer_14 : (1, 20,  6,  6)    new_buffer_14 : (1, 20,  6,  6)
+#   buffer_15 : (1, 20,  6,  6)    new_buffer_15 : (1, 20,  6,  6)
+#   buffer_16 : (1, 20,  6,  6)    new_buffer_16 : (1, 20,  6,  6)
+#
 # Luồng hoạt động:
 #   ┌─────────────────────────────────────┐
 #   │  CameraCapture (thread)             │  ← grab frame liên tục
@@ -11,8 +36,8 @@
 #         ┌────────┴────────┐
 #         ▼                 ▼
 #   VideoStreamer      InferenceWorker (thread)
-#   (async task)         TensorRT MobileNetV2-TSM
-#         │                 │
+#   (async task)         TensorRT MobileNetV2-TSM ONLINE
+#         │               1 frame/infer + 17 state buffers
 #         │ JPEG binary      │ JSON result
 #         ▼                 ▼
 #   ws://.../ws/stream/   ws://.../ws/detection/
@@ -23,7 +48,7 @@
 #              BuzzerController  PhoneDialer
 #              GPIO PIN 12        SIM module
 #              beep khi bạo lực   ATD0961521940;
-
+#
 # JSON detection payload (gửi mỗi lần infer):
 # {
 #   "camera_id":         "jetson-cam-01",
@@ -38,14 +63,13 @@
 #   "cam_fps":           29.8,
 #   "uptime":            142,
 #   "infer_ms":          118.4,
-#   "num_frames":        16,
-#   "violence_duration": 3.7,   // giây bạo lực liên tục (0 nếu Normal)
-#   "buzzer_active":     false,  // còi đang kêu hay không
-#   "phone_calling":     false,  // đang gọi điện hay không
+#   "violence_duration": 3.7,
+#   "buzzer_active":     false,
+#   "phone_calling":     false,
 #   "thumb_b64":         "<base64 jpeg 120x68>"
 # }
-
-# Chạy: python3 mobilenet_jetson_client_v5.py
+#
+# Chạy: python3 mobilenet_jetson_client_v6.py
 
 import cv2
 import numpy as np
@@ -92,9 +116,30 @@ STREAM_FPS        = 15      # FPS gửi lên backend
 JPEG_QUALITY      = 70
 
 # ── TensorRT model ───────────────────────────────────────
-ENGINE_PATH       = "mobilenetv2_tsm_16frames.engine"
-NUM_FRAMES        = 16
-INPUT_SIZE        = 172
+ENGINE_PATH       = "mobilenetv4.engine"   # ← tên file engine thực tế
+INPUT_SIZE        = 172                     # ← từ ONNX input shape (1,3,172,172)
+NUM_BUFFERS       = 17                      # ← số state buffer của ONLINE TSM
+
+# Shapes của 17 buffer (dùng để khởi tạo zero state)
+BUFFER_SHAPES = [
+    (1, 4,  86, 86),   # buffer_0
+    (1, 2,  86, 86),   # buffer_1
+    (1, 3,  43, 43),   # buffer_2
+    (1, 3,  43, 43),   # buffer_3
+    (1, 4,  22, 22),   # buffer_4
+    (1, 4,  22, 22),   # buffer_5
+    (1, 4,  22, 22),   # buffer_6
+    (1, 8,  11, 11),   # buffer_7
+    (1, 8,  11, 11),   # buffer_8
+    (1, 8,  11, 11),   # buffer_9
+    (1, 8,  11, 11),   # buffer_10
+    (1, 12, 11, 11),   # buffer_11
+    (1, 12, 11, 11),   # buffer_12
+    (1, 12, 11, 11),   # buffer_13
+    (1, 20,  6,  6),   # buffer_14
+    (1, 20,  6,  6),   # buffer_15
+    (1, 20,  6,  6),   # buffer_16
+]
 
 # ── Detection logic ───────────────────────────────────────
 CONF_THRESH       = 0.55    # ngưỡng xác suất để kích hoạt alert
@@ -168,7 +213,6 @@ class BuzzerController(threading.Thread):
             logger.warning("[Buzzer] Chạy ở chế độ giả lập (không có GPIO).")
 
     def activate(self):
-        """Yêu cầu còi bắt đầu kêu (gọi được từ bất kỳ thread nào)."""
         with self._cond:
             if not self._active:
                 self._active = True
@@ -176,7 +220,6 @@ class BuzzerController(threading.Thread):
                 logger.warning("[Buzzer] ⚠  KÍCH HOẠT CÒI CẢNH BÁO!")
 
     def deactivate(self):
-        """Tắt còi (gọi được từ bất kỳ thread nào)."""
         with self._cond:
             if self._active:
                 self._active = False
@@ -184,7 +227,6 @@ class BuzzerController(threading.Thread):
                 logger.info("[Buzzer] Tắt còi.")
 
     def stop(self):
-        """Dừng thread và cleanup GPIO."""
         with self._cond:
             self._running = False
             self._active  = False
@@ -223,7 +265,6 @@ class BuzzerController(threading.Thread):
                 logger.debug("[Buzzer][SIM] BEEP ON")
 
     def _interruptible_sleep(self, seconds: float):
-        """Ngủ nhưng có thể bị ngắt sớm khi trạng thái thay đổi."""
         deadline = time.time() + seconds
         while time.time() < deadline:
             with self._cond:
@@ -238,17 +279,6 @@ class BuzzerController(threading.Thread):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class PhoneDialer(threading.Thread):
-    """
-    Thread quản lý gọi điện thoại qua SIM module.
-
-    Cách dùng:
-        dialer = PhoneDialer()
-        dialer.start()
-        dialer.request_call()   # trigger gọi khi bạo lực ≥ ngưỡng
-        dialer.cancel_call()    # cúp máy khi về Normal
-        dialer.stop()           # dừng thread
-    """
-
     _STATE_IDLE    = "IDLE"
     _STATE_CALLING = "CALLING"
 
@@ -265,8 +295,6 @@ class PhoneDialer(threading.Thread):
         self._last_call_end = 0.0
 
         self._open_serial()
-
-    # ── Serial helpers ───────────────────────────────────
 
     def _open_serial(self):
         try:
@@ -299,10 +327,7 @@ class PhoneDialer(threading.Thread):
             logger.error(f"[Phone] Lỗi AT '{cmd}': {e}")
             return ""
 
-    # ── Public API ───────────────────────────────────────
-
     def request_call(self):
-        """Yêu cầu gọi điện — bỏ qua nếu đang gọi hoặc trong cooldown."""
         with self._cond:
             if self._state != self._STATE_IDLE:
                 return
@@ -318,7 +343,6 @@ class PhoneDialer(threading.Thread):
                 logger.debug(f"[Phone] Cooldown còn {remain:.0f}s — bỏ qua.")
 
     def cancel_call(self):
-        """Cúp máy ngay (khi về Normal)."""
         with self._cond:
             if self._state == self._STATE_CALLING:
                 self._cancel = True
@@ -326,7 +350,6 @@ class PhoneDialer(threading.Thread):
                 logger.info("[Phone] Yêu cầu cúp máy (về Normal).")
 
     def stop(self):
-        """Dừng thread, cúp máy nếu đang gọi, đóng serial."""
         with self._cond:
             self._running   = False
             self._cancel    = True
@@ -337,8 +360,6 @@ class PhoneDialer(threading.Thread):
     def is_calling(self) -> bool:
         with self._lock:
             return self._state == self._STATE_CALLING
-
-    # ── Thread body ──────────────────────────────────────
 
     def run(self):
         try:
@@ -363,13 +384,11 @@ class PhoneDialer(threading.Thread):
     def _do_call(self):
         logger.warning(f"[Phone] ☎  Đang quay số {PHONE_NUMBER} …")
         if self.available:
-            self._send_at("ATE0")                        # tắt echo
-            self._send_at(f"ATD{PHONE_NUMBER};",         # quay số
-                          wait=PHONE_RING_WAIT)
+            self._send_at("ATE0")
+            self._send_at(f"ATD{PHONE_NUMBER};", wait=PHONE_RING_WAIT)
         else:
             logger.warning(f"[Phone][SIM] GIẢ LẬP: ATD{PHONE_NUMBER};")
 
-        # Duy trì cuộc gọi hoặc đến khi bị cancel / dừng
         deadline = time.time() + PHONE_CALL_TIMEOUT
         while time.time() < deadline:
             with self._cond:
@@ -458,16 +477,32 @@ class CameraCapture(threading.Thread):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  TENSORRT MODEL  (MobileNetV2-TSM 16-frame)
+#  TENSORRT MODEL  — MobileNetV2-TSM ONLINE (1-frame streaming)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class MobileNetTRT:
     """
-    Wrapper TensorRT cho MobileNetV2-TSM.
-    Input : (1, 16, 3, INPUT_SIZE, INPUT_SIZE)  float32  ImageNet-normalized
-    Output: (1, 2)  logits  [normal, violence]
+    Wrapper TensorRT cho MobileNetV2-TSM ONLINE mode.
+
+    Binding order (từ engine):
+        Input  bindings: 'input', 'buffer_0' … 'buffer_16'   (18 inputs)
+        Output bindings: 'output', 'new_buffer_0' … 'new_buffer_16'  (18 outputs)
+
+    Workflow mỗi frame:
+        1. Copy frame blob → input device memory
+        2. Copy current state buffers → buffer_0..16 device memory
+        3. Execute inference
+        4. Read output logits + new state buffers từ device
+        5. Cập nhật state buffers cho lần infer tiếp theo
+
+    State buffers được khởi tạo bằng zeros và tự động cập nhật sau mỗi infer.
     """
-    def __init__(self, engine_path, cuda_ctx):
+
+    # Thứ tự binding theo tên — phải khớp với engine
+    INPUT_NAMES  = ["input"] + [f"buffer_{i}"     for i in range(NUM_BUFFERS)]
+    OUTPUT_NAMES = ["output"] + [f"new_buffer_{i}" for i in range(NUM_BUFFERS)]
+
+    def __init__(self, engine_path: str, cuda_ctx):
         self.cuda_ctx = cuda_ctx
         self.cuda_ctx.push()
 
@@ -475,40 +510,109 @@ class MobileNetTRT:
             self.engine = trt.Runtime(TRT_LOGGER).deserialize_cuda_engine(f.read())
 
         self.context  = self.engine.create_execution_context()
-        self.inputs   = []
-        self.outputs  = []
-        self.bindings = []
+        self.stream   = cuda.Stream()
+
+        # ── Phân loại bindings theo tên ──────────────────
+        self._in_bufs  = {}   # name → {"device": ..., "host": ...}
+        self._out_bufs = {}   # name → {"device": ..., "host": ...}
+        self._bindings = [None] * self.engine.num_bindings
 
         for b in self.engine:
-            shape   = tuple(self.engine.get_binding_shape(b))
-            dtype   = trt.nptype(self.engine.get_binding_dtype(b))
-            dev_mem = cuda.mem_alloc(int(np.prod(shape)) * np.dtype(dtype).itemsize)
-            self.bindings.append(int(dev_mem))
-            info = {
-                "device": dev_mem,
-                "host":   cuda.pagelocked_empty(shape, dtype),
-            }
+            idx   = self.engine.get_binding_index(b)
+            shape = tuple(self.engine.get_binding_shape(b))
+            dtype = trt.nptype(self.engine.get_binding_dtype(b))
+            size  = int(np.prod(shape)) * np.dtype(dtype).itemsize
+            dev   = cuda.mem_alloc(size)
+            host  = cuda.pagelocked_empty(shape, dtype)
+            info  = {"device": dev, "host": host, "shape": shape, "dtype": dtype}
+            self._bindings[idx] = int(dev)
             if self.engine.binding_is_input(b):
-                self.inputs.append(info)
+                self._in_bufs[b]  = info
             else:
-                self.outputs.append(info)
+                self._out_bufs[b] = info
 
-        self.stream = cuda.Stream()
+        # ── Kiểm tra đủ bindings ──────────────────────────
+        missing_in  = [n for n in self.INPUT_NAMES  if n not in self._in_bufs]
+        missing_out = [n for n in self.OUTPUT_NAMES if n not in self._out_bufs]
+        if missing_in or missing_out:
+            raise RuntimeError(
+                f"[TRT] Engine thiếu bindings!\n"
+                f"  Inputs missing : {missing_in}\n"
+                f"  Outputs missing: {missing_out}"
+            )
+
+        # ── Khởi tạo state buffers = zeros ───────────────
+        for i in range(NUM_BUFFERS):
+            name = f"buffer_{i}"
+            self._in_bufs[name]["host"].fill(0)
+            cuda.memcpy_htod_async(
+                self._in_bufs[name]["device"],
+                self._in_bufs[name]["host"],
+                self.stream,
+            )
+        self.stream.synchronize()
+
         self.cuda_ctx.pop()
-        logger.info(f"[TRT] MobileNetV2-TSM loaded — "
-                    f"{self.engine.num_bindings} bindings")
+        logger.info(
+            f"[TRT] MobileNetV2-TSM ONLINE loaded from '{engine_path}' — "
+            f"{self.engine.num_bindings} bindings  "
+            f"({len(self._in_bufs)} inputs / {len(self._out_bufs)} outputs)"
+        )
 
-    def infer(self, blob: np.ndarray) -> np.ndarray:
+    def infer(self, frame_blob: np.ndarray) -> np.ndarray:
+        """
+        frame_blob: (1, 3, INPUT_SIZE, INPUT_SIZE) float32, ImageNet-normalized
+        Returns   : (2,) float32  logits  [normal, violence]
+        """
         self.cuda_ctx.push()
         try:
-            self.inputs[0]["host"].flat[:] = blob.ravel()
-            cuda.memcpy_htod_async(
-                self.inputs[0]["device"], self.inputs[0]["host"], self.stream)
-            self.context.execute_async_v2(self.bindings, self.stream.handle)
-            cuda.memcpy_dtoh_async(
-                self.outputs[0]["host"], self.outputs[0]["device"], self.stream)
+            # 1. Copy frame vào input
+            inp = self._in_bufs["input"]
+            inp["host"].flat[:] = frame_blob.ravel()
+            cuda.memcpy_htod_async(inp["device"], inp["host"], self.stream)
+
+            # 2. State buffers đã nằm trên device từ lần trước (hoặc zeros)
+            #    → không cần copy lại, chỉ cần đảm bảo bindings trỏ đúng
+
+            # 3. Execute
+            self.context.execute_async_v2(self._bindings, self.stream.handle)
+
+            # 4. Copy output → host
+            out_info = self._out_bufs["output"]
+            cuda.memcpy_dtoh_async(out_info["host"], out_info["device"], self.stream)
+
+            # 5. Copy new_buffer_* về host rồi ngay lập tức copy vào buffer_* device
+            for i in range(NUM_BUFFERS):
+                new_buf = self._out_bufs[f"new_buffer_{i}"]
+                cur_buf = self._in_bufs[f"buffer_{i}"]
+                cuda.memcpy_dtoh_async(new_buf["host"], new_buf["device"], self.stream)
+
             self.stream.synchronize()
-            return self.outputs[0]["host"].copy().flatten()
+
+            # 6. Cập nhật state: host new_buffer_i → device buffer_i
+            for i in range(NUM_BUFFERS):
+                new_buf = self._out_bufs[f"new_buffer_{i}"]
+                cur_buf = self._in_bufs[f"buffer_{i}"]
+                np.copyto(cur_buf["host"], new_buf["host"])
+                cuda.memcpy_htod_async(cur_buf["device"], cur_buf["host"], self.stream)
+
+            self.stream.synchronize()
+
+            return out_info["host"].copy().flatten()
+
+        finally:
+            self.cuda_ctx.pop()
+
+    def reset_state(self):
+        """Reset toàn bộ state buffers về zero (dùng khi muốn bắt đầu lại)."""
+        self.cuda_ctx.push()
+        try:
+            for i in range(NUM_BUFFERS):
+                buf = self._in_bufs[f"buffer_{i}"]
+                buf["host"].fill(0)
+                cuda.memcpy_htod_async(buf["device"], buf["host"], self.stream)
+            self.stream.synchronize()
+            logger.info("[TRT] State buffers đã reset về zero.")
         finally:
             self.cuda_ctx.pop()
 
@@ -524,19 +628,17 @@ class MobileNetTRT:
 #  PREPROCESSING HELPERS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def preprocess(frames: list) -> np.ndarray:
+def preprocess_frame(frame: np.ndarray) -> np.ndarray:
     """
-    frames: list of NUM_FRAMES BGR numpy arrays
-    Returns: (1, NUM_FRAMES, 3, INPUT_SIZE, INPUT_SIZE) float32
+    frame: BGR numpy array (H, W, 3) từ OpenCV
+    Returns: (1, 3, INPUT_SIZE, INPUT_SIZE) float32  ImageNet-normalized
     """
-    out = []
-    for f in frames:
-        rgb = cv2.cvtColor(f, cv2.COLOR_BGR2RGB)
-        r   = cv2.resize(rgb, (INPUT_SIZE, INPUT_SIZE),
-                         interpolation=cv2.INTER_LINEAR)
-        n   = (r.astype(np.float32) / 255.0 - MEAN) / STD
-        out.append(n.transpose(2, 0, 1))   # (3, H, W)
-    return np.ascontiguousarray(np.stack(out)[np.newaxis], dtype=np.float32)
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    r   = cv2.resize(rgb, (INPUT_SIZE, INPUT_SIZE),
+                     interpolation=cv2.INTER_LINEAR)
+    n   = (r.astype(np.float32) / 255.0 - MEAN) / STD
+    chw = n.transpose(2, 0, 1)                        # (3, H, W)
+    return np.ascontiguousarray(chw[np.newaxis], dtype=np.float32)  # (1,3,H,W)
 
 
 def softmax(x: np.ndarray) -> np.ndarray:
@@ -584,12 +686,22 @@ def run_inference(cam: CameraCapture,
                   dialer: PhoneDialer,
                   start_time: float):
     """
+<<<<<<< HEAD:mobilenet_jetson_client.py
     Thu thập NUM_FRAMES frame từ camera, chạy TRT inference,
     áp dụng logic alert, rồi đẩy payload vào result_queue.
 
     Bổ sung so với v4:
       - PhoneDialer gọi số PHONE_NUMBER khi bạo lực ≥ VIOLENCE_BUZZER_DELAY giây.
       - Cúp máy + tắt còi ngay khi về Normal.
+=======
+    ONLINE TSM mode: infer từng frame một.
+    State 17 buffers được duy trì tự động bên trong MobileNetTRT.
+
+    So với v5:
+      - Bỏ frame_buffer (deque NUM_FRAMES) — không còn cần tích lũy 16 frames
+      - Bỏ bước "Buffering X/NUM_FRAMES" — infer ngay từ frame đầu tiên
+      - preprocess_frame() thay cho preprocess(list_of_frames)
+>>>>>>> 22369a0519a9004d60401dde26dc8117c5accd11:models/mobilenet_jetson_client.py
     """
     cuda.init()
     cuda_ctx = cuda.Device(0).make_context()
@@ -603,16 +715,13 @@ def run_inference(cam: CameraCapture,
             break
         time.sleep(0.1)
 
-    # ── Frame buffer (sliding window NUM_FRAMES frames) ──
-    frame_buffer = deque(maxlen=NUM_FRAMES)
-
     # ── Alert state ───────────────────────────────────────
     alert_until = 0.0
     is_alert    = False
 
     # ── Biến theo dõi thời gian bạo lực liên tục ─────────
-    violence_start_time = None   # None = không có bạo lực hiện tại
-    alert_triggered     = False  # đã trigger còi + gọi điện trong đợt này chưa
+    violence_start_time = None
+    alert_triggered     = False
 
     # ── FPS tracking ─────────────────────────────────────
     cam_times   = deque(maxlen=60)
@@ -627,23 +736,15 @@ def run_inference(cam: CameraCapture,
 
             now = time.time()
             startup_muted = (now - start_time) < STARTUP_MUTE_SECONDS
-            frame_buffer.append(frame)
             cam_times.append(now)
 
-            # Chờ đủ NUM_FRAMES mới bắt đầu infer
-            if len(frame_buffer) < NUM_FRAMES:
-                logger.info(
-                    f"[Inference] Buffering {len(frame_buffer)}/{NUM_FRAMES}…")
-                time.sleep(0.05)
-                continue
-
-            # ── Inference ────────────────────────────────
+            # ── Inference (1 frame, ONLINE mode) ─────────
             t0 = time.time()
             try:
-                blob     = preprocess(list(frame_buffer))
-                logits   = model.infer(blob)
-                probs    = softmax(logits)
-                prob_raw = float(probs[1])   # index 1 = violence
+                blob   = preprocess_frame(frame)   # (1,3,172,172)
+                logits = model.infer(blob)          # (2,)  [normal, violence]
+                probs  = softmax(logits)
+                prob_raw = float(probs[1])          # index 1 = violence
             except Exception as e:
                 logger.error(f"[Inference] Lỗi infer: {e}")
                 time.sleep(0.05)
@@ -671,13 +772,10 @@ def run_inference(cam: CameraCapture,
 
                 if violence_duration >= VIOLENCE_BUZZER_DELAY:
                     if startup_muted:
-                        # Mute lúc khởi động: không cho còi/gọi dù đã vượt ngưỡng
                         buzzer.deactivate()
                         dialer.cancel_call()
                     else:
-                        # Kích hoạt còi liên tục
                         buzzer.activate()
-                        # Gọi điện một lần (PhoneDialer tự quản cooldown)
                         if not alert_triggered:
                             dialer.request_call()
                             alert_triggered = True
@@ -688,7 +786,6 @@ def run_inference(cam: CameraCapture,
                         f"/ {VIOLENCE_BUZZER_DELAY}s "
                         f"(còn {remaining:.1f}s nữa)")
             else:
-                # Về Normal → reset đếm + tắt còi + cúp máy
                 if violence_start_time is not None:
                     elapsed = now - violence_start_time
                     logger.info(
@@ -702,8 +799,8 @@ def run_inference(cam: CameraCapture,
             # ── FPS ──────────────────────────────────────
             infer_fps = (len(infer_times) - 1) / (infer_times[-1] - infer_times[0]) \
                         if len(infer_times) > 1 else 0.0
-            cam_fps   = (len(cam_times) - 1) / (cam_times[-1] - cam_times[0]) \
-                        if len(cam_times) > 1 else 0.0
+            cam_fps   = (len(cam_times)   - 1) / (cam_times[-1]   - cam_times[0]) \
+                        if len(cam_times)   > 1 else 0.0
 
             # ── Thumbnail ────────────────────────────────
             thumb = cv2.resize(frame, (THUMB_WIDTH, THUMB_HEIGHT),
@@ -729,7 +826,6 @@ def run_inference(cam: CameraCapture,
                 "cam_fps":           round(cam_fps,             1),
                 "uptime":            int(now - start_time),
                 "infer_ms":          round((t1 - t0) * 1000,    1),
-                "num_frames":        NUM_FRAMES,
                 "violence_duration": round(violence_duration,   2),
                 "buzzer_active":     buzzer.is_active,
                 "phone_calling":     dialer.is_calling,
@@ -749,8 +845,8 @@ def run_inference(cam: CameraCapture,
     except Exception as e:
         logger.exception(f"[Inference] Lỗi nghiêm trọng: {e}")
     finally:
-        buzzer.deactivate()     # Đảm bảo tắt còi khi inference dừng
-        dialer.cancel_call()    # Đảm bảo cúp máy khi inference dừng
+        buzzer.deactivate()
+        dialer.cancel_call()
         model.destroy()
 
 
@@ -817,15 +913,12 @@ async def stream_detection(result_queue: DetectionResult):
 async def main():
     start_time = time.time()
 
-    # ── Khởi động Buzzer ──────────────────────────────────
     buzzer = BuzzerController()
     buzzer.start()
 
-    # ── Khởi động PhoneDialer ────────────────────────────
     dialer = PhoneDialer()
     dialer.start()
 
-    # ── Khởi động camera ─────────────────────────────────
     cam = CameraCapture()
     cam.start()
     logger.info("[Main] Chờ camera kết nối …")
@@ -842,11 +935,9 @@ async def main():
 
     logger.info(f"[Main] Camera sẵn sàng — index={cam.camera_id}")
 
-    # ── Tạo DetectionResult với event loop hiện tại ──────
     loop = asyncio.get_event_loop()
     result_queue = DetectionResult(loop)
 
-    # ── Khởi động inference thread ───────────────────────
     infer_thread = threading.Thread(
         target=run_inference,
         args=(cam, result_queue, buzzer, dialer, start_time),
@@ -855,14 +946,15 @@ async def main():
     infer_thread.start()
     logger.info("[Main] Inference thread đã khởi động")
 
-    # ── In thông tin cấu hình ─────────────────────────────
     print("=" * 60)
-    print("  Jetson Violence Detection Client — MobileNetV2-TSM  [v5]")
+    print("  Jetson Violence Detection Client — MobileNetV2-TSM  [v6]")
+    print(f"  MODEL MODE         : ONLINE (1-frame streaming)")
+    print(f"  Engine file        : {ENGINE_PATH}")
+    print(f"  State buffers      : {NUM_BUFFERS} buffers (tự động)")
     print(f"  Camera index       : {cam.camera_id}")
     print(f"  Stream URL         : {WS_STREAM_URL}")
     print(f"  Detection URL      : {WS_DETECTION_URL}")
     print(f"  Stream FPS         : {STREAM_FPS}")
-    print(f"  Num frames         : {NUM_FRAMES} (sliding window)")
     print(f"  Input size         : {INPUT_SIZE}x{INPUT_SIZE}")
     print(f"  Conf thresh        : {CONF_THRESH}")
     print(f"  Alert window       : {ALERT_SECONDS}s")
@@ -879,7 +971,6 @@ async def main():
     print(f"  Cooldown gọi lại   : {PHONE_RETRY_DELAY}s")
     print("=" * 60)
 
-    # ── Chạy 2 async task song song ───────────────────────
     try:
         await asyncio.gather(
             stream_video(cam),
