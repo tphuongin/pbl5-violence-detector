@@ -1,5 +1,9 @@
-const API_BASE_URL = 'http://localhost:8000/api';
+export const API_BASE_URL = 'http://localhost:8000/api';
 // const API_BASE_URL = 'http://192.168.137.1:8000/api'; 
+
+export const WS_BASE_URL = API_BASE_URL
+  .replace(/\/api\/?$/, '')
+  .replace(/^http/, 'ws');
 
 console.log('API Base URL:', API_BASE_URL);
 
@@ -90,5 +94,42 @@ export const apiService = {
       console.error('Error fetching calls:', error);
       return { count: 0, data: [] };
     }
+  },
+
+  analyzeVideo: async (file) => {
+    const formData = new FormData();
+    formData.append('video', file);
+
+    const response = await fetch(`${API_BASE_URL}/analyze-video`, {
+      method: 'POST',
+      body: formData,
+    });
+
+    let payload = null;
+    try {
+      payload = await response.json();
+    } catch (error) {
+      payload = { detail: 'Invalid response from server' };
+    }
+
+    return { status: response.status, payload };
+  },
+
+  getVideoAnalysisStatus: async (jobId) => {
+    const response = await fetch(`${API_BASE_URL}/video-analysis/${jobId}/status`);
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    return await response.json();
+  },
+
+  cancelVideoAnalysis: async (jobId) => {
+    const response = await fetch(`${API_BASE_URL}/video-analysis/${jobId}/cancel`, {
+      method: 'POST',
+    });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    return await response.json();
   },
 };

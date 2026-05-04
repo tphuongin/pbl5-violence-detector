@@ -1,6 +1,6 @@
-from fastapi import FastAPI, Depends, HTTPException, File, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Depends, HTTPException, File, UploadFile, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from sqlalchemy.orm import Session
 from database import engine, Base, SessionLocal, get_db, init_db
 from models import User, Camera, Call, ViolenceHistory
@@ -12,6 +12,8 @@ import asyncio
 from dotenv import load_dotenv
 import logging
 import json
+from typing import Dict, Set, List
+import httpx
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -30,8 +32,60 @@ app = FastAPI(
     version="1.0.0"
 )
 
+# Jetson configuration
+JETSON_IP = os.getenv("JETSON_IP", "192.168.137.2")
+JETSON_HTTP_PORT = int(os.getenv("JETSON_HTTP_PORT", "8001"))
+JETSON_BASE_URL = f"http://{JETSON_IP}:{JETSON_HTTP_PORT}"
+
+BACKEND_HOST_OVERRIDE = os.getenv("BACKEND_HOST")
+
 # Keep latest detection payload per camera in memory for quick access.
 latest_detections: dict = {}
+
+
+class VideoAnalysisHub:
+    def __init__(self):
+        self._consumers: Dict[str, Set[WebSocket]] = {}
+        self._lock = asyncio.Lock()
+
+    async def register_consumer(self, job_id: str, ws: WebSocket):
+        async with self._lock:
+            self._consumers.setdefault(job_id, set()).add(ws)
+
+    async def unregister_consumer(self, job_id: str, ws: WebSocket):
+        async with self._lock:
+            consumers = self._consumers.get(job_id)
+            if not consumers:
+                return
+            consumers.discard(ws)
+            if not consumers:
+                self._consumers.pop(job_id, None)
+
+    async def broadcast(self, job_id: str, message: str):
+        async with self._lock:
+            consumers = list(self._consumers.get(job_id, set()))
+
+        if not consumers:
+            return
+
+        stale: List[WebSocket] = []
+        for ws in consumers:
+            try:
+                await ws.send_text(message)
+            except Exception:
+                stale.append(ws)
+
+        if stale:
+            async with self._lock:
+                remaining = self._consumers.get(job_id)
+                if remaining:
+                    for ws in stale:
+                        remaining.discard(ws)
+                    if not remaining:
+                        self._consumers.pop(job_id, None)
+
+
+hub = VideoAnalysisHub()
 
 # Add CORS middleware
 app.add_middleware(
@@ -345,6 +399,145 @@ def get_latest_detection(camera_id: str):
     if not data:
         raise HTTPException(status_code=404, detail="No detection data for this camera")
     return data
+
+
+def _resolve_backend_host(request: Request) -> str:
+    if BACKEND_HOST_OVERRIDE:
+        return BACKEND_HOST_OVERRIDE
+
+    forwarded = request.headers.get("x-forwarded-host")
+    host_header = forwarded or request.headers.get("host")
+    if host_header:
+        return host_header.split(":")[0]
+
+    return request.client.host if request.client else "localhost"
+
+
+@app.post("/api/analyze-video")
+async def analyze_video(request: Request, video: UploadFile = File(...)):
+    try:
+        content = await video.read()
+        backend_host = _resolve_backend_host(request)
+        files = {
+            "video": (
+                video.filename,
+                content,
+                video.content_type or "application/octet-stream",
+            )
+        }
+        data = {"backend_host": backend_host}
+
+        timeout = httpx.Timeout(60.0, connect=5.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(
+                f"{JETSON_BASE_URL}/analyze-video",
+                data=data,
+                files=files,
+            )
+    except httpx.ConnectError:
+        raise HTTPException(status_code=503, detail="Cannot connect to Jetson")
+    except httpx.ReadTimeout:
+        raise HTTPException(status_code=504, detail="Jetson timeout")
+    except httpx.HTTPError as exc:
+        logger.error(f"Jetson request failed: {exc}")
+        raise HTTPException(status_code=503, detail="Jetson request failed")
+
+    if response.status_code == 409:
+        try:
+            return JSONResponse(status_code=409, content=response.json())
+        except json.JSONDecodeError:
+            return JSONResponse(status_code=409, content={"detail": response.text})
+
+    if response.status_code >= 400:
+        raise HTTPException(status_code=response.status_code, detail=response.text)
+
+    return response.json()
+
+
+@app.get("/api/video-analysis/{job_id}/status")
+async def get_video_analysis_status(job_id: str):
+    try:
+        timeout = httpx.Timeout(10.0, connect=5.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.get(f"{JETSON_BASE_URL}/status")
+    except httpx.ConnectError:
+        raise HTTPException(status_code=503, detail="Cannot connect to Jetson")
+    except httpx.ReadTimeout:
+        raise HTTPException(status_code=504, detail="Jetson timeout")
+    except httpx.HTTPError as exc:
+        logger.error(f"Jetson request failed: {exc}")
+        raise HTTPException(status_code=503, detail="Jetson request failed")
+
+    if response.status_code >= 400:
+        raise HTTPException(status_code=response.status_code, detail=response.text)
+
+    try:
+        payload = response.json()
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=502, detail="Invalid status response from Jetson")
+
+    jobs = payload.get("jobs") if isinstance(payload, dict) else payload
+    if not isinstance(jobs, list):
+        raise HTTPException(status_code=502, detail="Unexpected status payload")
+
+    job = next((item for item in jobs if item.get("job_id") == job_id), None)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    return job
+
+
+@app.post("/api/video-analysis/{job_id}/cancel")
+async def cancel_video_analysis(job_id: str):
+    payload = {"job_id": job_id}
+    try:
+        timeout = httpx.Timeout(10.0, connect=5.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(f"{JETSON_BASE_URL}/cancel", json=payload)
+    except httpx.ConnectError:
+        raise HTTPException(status_code=503, detail="Cannot connect to Jetson")
+    except httpx.ReadTimeout:
+        raise HTTPException(status_code=504, detail="Jetson timeout")
+    except httpx.HTTPError as exc:
+        logger.error(f"Jetson request failed: {exc}")
+        raise HTTPException(status_code=503, detail="Jetson request failed")
+
+    if response.status_code >= 400:
+        raise HTTPException(status_code=response.status_code, detail=response.text)
+
+    return response.json()
+
+
+@app.websocket("/ws/video-analysis/{job_id}")
+async def websocket_video_analysis(websocket: WebSocket, job_id: str):
+    role = websocket.query_params.get("role", "consumer")
+
+    if role == "producer":
+        await websocket.accept()
+        logger.info(f"Video analysis producer connected for job {job_id}")
+        try:
+            while True:
+                message = await websocket.receive_text()
+                await hub.broadcast(job_id, message)
+        except WebSocketDisconnect:
+            logger.info(f"Video analysis producer disconnected for job {job_id}")
+        except Exception as exc:
+            logger.error(f"Video analysis producer error for job {job_id}: {exc}")
+        return
+
+    await websocket.accept()
+    await hub.register_consumer(job_id, websocket)
+    logger.info(f"Video analysis consumer connected for job {job_id}")
+    try:
+        while True:
+            await asyncio.sleep(30)
+            await websocket.send_text('{"type":"ping"}')
+    except WebSocketDisconnect:
+        logger.info(f"Video analysis consumer disconnected for job {job_id}")
+    except Exception as exc:
+        logger.error(f"Video analysis consumer error for job {job_id}: {exc}")
+    finally:
+        await hub.unregister_consumer(job_id, websocket)
 
 if __name__ == "__main__":
     import uvicorn
