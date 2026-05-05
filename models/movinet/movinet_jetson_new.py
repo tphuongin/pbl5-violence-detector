@@ -1,5 +1,5 @@
 """
-Bản mới
+movinet_jetson_client_v4.py
 
 Luồng hoạt động:
   CameraCapture (thread) → frame_event
@@ -60,7 +60,7 @@ SPIKE_BOOST      = 1.35
 
 THRESHOLD        = 0.50
 CONFIRM_FRAMES   = 2
-COOLDOWN_SEC     = 0.8
+COOLDOWN_SEC     = 0.3
 
 THUMB_WIDTH      = 120
 THUMB_HEIGHT     = 68
@@ -87,48 +87,48 @@ LOGITS_NAME = 'StatefulPartitionedCall:0'
 
 STATE_MAP = {
     'serving_default_state_block4_layer1_pool_frame_count:0': 'StatefulPartitionedCall:37',
-    'serving_default_state_block1_layer1_stream_buffer:0': 'StatefulPartitionedCall:8',
-    'serving_default_state_block1_layer2_stream_buffer:0': 'StatefulPartitionedCall:11',
+    'serving_default_state_block1_layer1_stream_buffer:0':    'StatefulPartitionedCall:8',
+    'serving_default_state_block1_layer2_stream_buffer:0':    'StatefulPartitionedCall:11',
     'serving_default_state_block3_layer1_pool_frame_count:0': 'StatefulPartitionedCall:25',
-    'serving_default_state_block3_layer2_pool_buffer:0': 'StatefulPartitionedCall:27',
+    'serving_default_state_block3_layer2_pool_buffer:0':      'StatefulPartitionedCall:27',
     'serving_default_state_block3_layer3_pool_frame_count:0': 'StatefulPartitionedCall:31',
-    'serving_default_state_block4_layer0_pool_buffer:0': 'StatefulPartitionedCall:33',
-    'serving_default_state_head_pool_frame_count:0': 'StatefulPartitionedCall:43',
-    'serving_default_state_block3_layer0_stream_buffer:0': 'StatefulPartitionedCall:23',
-    'serving_default_state_block2_layer2_stream_buffer:0': 'StatefulPartitionedCall:20',
-    'serving_default_state_block2_layer1_pool_buffer:0': 'StatefulPartitionedCall:15',
-    'serving_default_state_block2_layer1_stream_buffer:0': 'StatefulPartitionedCall:17',
-    'serving_default_state_block3_layer1_stream_buffer:0': 'StatefulPartitionedCall:26',
+    'serving_default_state_block4_layer0_pool_buffer:0':      'StatefulPartitionedCall:33',
+    'serving_default_state_head_pool_frame_count:0':          'StatefulPartitionedCall:43',
+    'serving_default_state_block3_layer0_stream_buffer:0':    'StatefulPartitionedCall:23',
+    'serving_default_state_block2_layer2_stream_buffer:0':    'StatefulPartitionedCall:20',
+    'serving_default_state_block2_layer1_pool_buffer:0':      'StatefulPartitionedCall:15',
+    'serving_default_state_block2_layer1_stream_buffer:0':    'StatefulPartitionedCall:17',
+    'serving_default_state_block3_layer1_stream_buffer:0':    'StatefulPartitionedCall:26',
     'serving_default_state_block4_layer0_pool_frame_count:0': 'StatefulPartitionedCall:34',
-    'serving_default_state_block3_layer3_stream_buffer:0': 'StatefulPartitionedCall:32',
-    'serving_default_state_block1_layer1_pool_buffer:0': 'StatefulPartitionedCall:6',
+    'serving_default_state_block3_layer3_stream_buffer:0':    'StatefulPartitionedCall:32',
+    'serving_default_state_block1_layer1_pool_buffer:0':      'StatefulPartitionedCall:6',
     'serving_default_state_block3_layer2_pool_frame_count:0': 'StatefulPartitionedCall:28',
-    'serving_default_state_block0_layer0_pool_buffer:0': 'StatefulPartitionedCall:1',
+    'serving_default_state_block0_layer0_pool_buffer:0':      'StatefulPartitionedCall:1',
     'serving_default_state_block0_layer0_pool_frame_count:0': 'StatefulPartitionedCall:2',
     'serving_default_state_block1_layer0_pool_frame_count:0': 'StatefulPartitionedCall:4',
-    'serving_default_state_block3_layer0_pool_buffer:0': 'StatefulPartitionedCall:21',
+    'serving_default_state_block3_layer0_pool_buffer:0':      'StatefulPartitionedCall:21',
     'serving_default_state_block2_layer2_pool_frame_count:0': 'StatefulPartitionedCall:19',
     'serving_default_state_block2_layer0_pool_frame_count:0': 'StatefulPartitionedCall:13',
     'serving_default_state_block4_layer2_pool_frame_count:0': 'StatefulPartitionedCall:39',
     'serving_default_state_block1_layer1_pool_frame_count:0': 'StatefulPartitionedCall:7',
-    'serving_default_state_block3_layer2_stream_buffer:0': 'StatefulPartitionedCall:29',
-    'serving_default_state_block4_layer0_stream_buffer:0': 'StatefulPartitionedCall:35',
-    'serving_default_state_block1_layer0_stream_buffer:0': 'StatefulPartitionedCall:5',
-    'serving_default_state_block3_layer1_pool_buffer:0': 'StatefulPartitionedCall:24',
-    'serving_default_state_block4_layer3_pool_buffer:0': 'StatefulPartitionedCall:40',
-    'serving_default_state_block1_layer0_pool_buffer:0': 'StatefulPartitionedCall:3',
+    'serving_default_state_block3_layer2_stream_buffer:0':    'StatefulPartitionedCall:29',
+    'serving_default_state_block4_layer0_stream_buffer:0':    'StatefulPartitionedCall:35',
+    'serving_default_state_block1_layer0_stream_buffer:0':    'StatefulPartitionedCall:5',
+    'serving_default_state_block3_layer1_pool_buffer:0':      'StatefulPartitionedCall:24',
+    'serving_default_state_block4_layer3_pool_buffer:0':      'StatefulPartitionedCall:40',
+    'serving_default_state_block1_layer0_pool_buffer:0':      'StatefulPartitionedCall:3',
     'serving_default_state_block3_layer0_pool_frame_count:0': 'StatefulPartitionedCall:22',
-    'serving_default_state_block2_layer0_stream_buffer:0': 'StatefulPartitionedCall:14',
-    'serving_default_state_block2_layer2_pool_buffer:0': 'StatefulPartitionedCall:18',
-    'serving_default_state_head_pool_buffer:0': 'StatefulPartitionedCall:42',
-    'serving_default_state_block4_layer1_pool_buffer:0': 'StatefulPartitionedCall:36',
+    'serving_default_state_block2_layer0_stream_buffer:0':    'StatefulPartitionedCall:14',
+    'serving_default_state_block2_layer2_pool_buffer:0':      'StatefulPartitionedCall:18',
+    'serving_default_state_head_pool_buffer:0':               'StatefulPartitionedCall:42',
+    'serving_default_state_block4_layer1_pool_buffer:0':      'StatefulPartitionedCall:36',
     'serving_default_state_block1_layer2_pool_frame_count:0': 'StatefulPartitionedCall:10',
-    'serving_default_state_block1_layer2_pool_buffer:0': 'StatefulPartitionedCall:9',
-    'serving_default_state_block2_layer0_pool_buffer:0': 'StatefulPartitionedCall:12',
+    'serving_default_state_block1_layer2_pool_buffer:0':      'StatefulPartitionedCall:9',
+    'serving_default_state_block2_layer0_pool_buffer:0':      'StatefulPartitionedCall:12',
     'serving_default_state_block4_layer3_pool_frame_count:0': 'StatefulPartitionedCall:41',
-    'serving_default_state_block4_layer2_pool_buffer:0': 'StatefulPartitionedCall:38',
-    'serving_default_state_block3_layer3_pool_buffer:0': 'StatefulPartitionedCall:30',
-    'serving_default_state_block2_layer1_pool_frame_count:0': 'StatefulPartitionedCall:16'
+    'serving_default_state_block4_layer2_pool_buffer:0':      'StatefulPartitionedCall:38',
+    'serving_default_state_block3_layer3_pool_buffer:0':      'StatefulPartitionedCall:30',
+    'serving_default_state_block2_layer1_pool_frame_count:0': 'StatefulPartitionedCall:16',
 }
 
 
@@ -499,18 +499,23 @@ def run_inference(cam: CameraCapture,
             # EMA smoothing
             prob_smooth = EMA_ALPHA * prob_raw + (1.0 - EMA_ALPHA) * prob_smooth
 
-            # Spike boost
-            if (prob_raw - prev_prob_raw) > SPIKE_THRESH:
+            # Spike / drop boost — đối xứng cả 2 chiều
+            delta = prob_raw - prev_prob_raw
+            if delta > SPIKE_THRESH:
                 prob_smooth = min(1.0, prob_smooth * SPIKE_BOOST)
+            elif delta < -SPIKE_THRESH:
+                prob_smooth = max(0.0, prob_smooth / SPIKE_BOOST)
             prev_prob_raw = prob_raw
 
             # Confirm + cooldown
+            # Chỉ cộng dồn violence_until khi prob_raw thực sự còn cao,
+            # tránh EMA quán tính tiếp tục kéo dài nhãn VIOLENCE.
             if prob_smooth >= THRESHOLD:
                 confirm_count += 1
             else:
                 confirm_count = 0
 
-            if confirm_count >= CONFIRM_FRAMES:
+            if confirm_count >= CONFIRM_FRAMES and prob_raw >= THRESHOLD:
                 violence_until = now + COOLDOWN_SEC
 
             label = 'VIOLENCE' if now < violence_until else 'Normal'
