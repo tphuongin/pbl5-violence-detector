@@ -5,7 +5,13 @@ from sqlalchemy.orm import Session
 from database import engine, Base, SessionLocal, get_db, init_db
 from models import User, Camera, Call, ViolenceHistory
 from upload_service import upload_service
-from stream_service import get_stream_buffer, add_frame_to_stream, get_stream_info
+from stream_service import (
+    get_stream_buffer,
+    add_frame_to_stream,
+    get_stream_info,
+    start_recording,
+    stop_recording,
+)
 import os
 import cv2
 import asyncio
@@ -18,6 +24,7 @@ import httpx
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 import tempfile
+from datetime import datetime
 
 # Load environment variables
 load_dotenv()
@@ -41,6 +48,11 @@ BACKEND_HOST_OVERRIDE = os.getenv("BACKEND_HOST")
 
 # Keep latest detection payload per camera in memory for quick access.
 latest_detections: dict = {}
+violence_states: dict = {}
+
+VIOLENCE_THRESHOLD = float(os.getenv("VIOLENCE_THRESHOLD", "0.6"))
+VIOLENCE_MIN_SECONDS = float(os.getenv("VIOLENCE_MIN_SECONDS", "5"))
+VIOLENCE_END_GRACE = float(os.getenv("VIOLENCE_END_GRACE", "2"))
 
 
 class VideoAnalysisHub:
@@ -86,6 +98,132 @@ class VideoAnalysisHub:
 
 
 hub = VideoAnalysisHub()
+
+
+def _resolve_camera_location(db: Session, camera_id: str) -> str:
+    camera = db.query(Camera).filter(Camera.CameraID == camera_id).first()
+    if not camera:
+        return camera_id
+    return camera.CameraName or camera_id
+
+
+def _write_video_file(frames, fps: int) -> str:
+    if not frames:
+        return None
+
+    height, width = frames[0].shape[:2]
+    if not height or not width:
+        return None
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+    temp_path = temp_file.name
+    temp_file.close()
+
+    writer = cv2.VideoWriter(temp_path, fourcc, fps or 30, (width, height))
+    for frame in frames:
+        writer.write(frame)
+    writer.release()
+    return temp_path
+
+
+def _save_violence_history(camera_id: str, start_time: datetime, end_time: datetime, max_conf: float):
+    if not start_time or not end_time:
+        return
+    recording = stop_recording(camera_id)
+    if not recording:
+        return
+
+    duration = (end_time - start_time).total_seconds()
+    if duration < VIOLENCE_MIN_SECONDS:
+        return
+
+    temp_path = _write_video_file(recording["frames"], recording["fps"])
+    if not temp_path:
+        return
+
+    db = SessionLocal()
+    try:
+        location = _resolve_camera_location(db, camera_id)
+        safe_timestamp = start_time.strftime("%Y%m%dT%H%M%S")
+        upload_result = upload_service.upload_detection_clip(
+            temp_path,
+            location=location,
+            timestamp=safe_timestamp,
+        )
+
+        if not upload_result.get("success"):
+            logger.error(f"Clip upload failed for camera {camera_id}: {upload_result.get('error')}")
+            return
+
+        record = ViolenceHistory(
+            Timestamp=start_time,
+            Location=location,
+            ClipURL=upload_result.get("url"),
+            Confidence=max_conf,
+            CameraID=camera_id,
+        )
+        db.add(record)
+        db.commit()
+    finally:
+        db.close()
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+
+
+async def _handle_violence_detection(camera_id: str, payload: dict) -> bool:
+    now = datetime.now()
+    label = payload.get("label")
+    prob = payload.get("prob_smooth")
+    is_violent = label == "VIOLENCE" and isinstance(prob, (int, float)) and prob >= VIOLENCE_THRESHOLD
+
+    recording_started = False
+
+    state = violence_states.get(camera_id)
+    if not state:
+        state = {
+            "active": False,
+            "start_time": None,
+            "last_violent_time": None,
+            "max_confidence": 0.0,
+        }
+        violence_states[camera_id] = state
+
+    if is_violent:
+        if not state["active"]:
+            start_recording(camera_id)
+            state["active"] = True
+            state["start_time"] = now
+            state["max_confidence"] = float(prob)
+            recording_started = True
+        else:
+            state["max_confidence"] = max(state["max_confidence"], float(prob))
+        state["last_violent_time"] = now
+        return recording_started
+
+    if state["active"] and state["last_violent_time"]:
+        idle_seconds = (now - state["last_violent_time"]).total_seconds()
+        if idle_seconds >= VIOLENCE_END_GRACE:
+            start_time = state["start_time"]
+            max_conf = state["max_confidence"]
+            state["active"] = False
+            state["start_time"] = None
+            state["last_violent_time"] = None
+            state["max_confidence"] = 0.0
+
+            loop = asyncio.get_running_loop()
+            loop.run_in_executor(
+                None,
+                _save_violence_history,
+                camera_id,
+                start_time,
+                now,
+                max_conf,
+            )
+
+    return recording_started
 
 # Add CORS middleware
 app.add_middleware(
@@ -150,19 +288,34 @@ def get_camera_by_id(camera_id: str, db: Session = Depends(get_db)):
 
 # ============= VIOLENCE HISTORY ENDPOINTS =============
 @app.get("/api/violence-history")
-def get_violence_history(db: Session = Depends(get_db)):
-    """Get all violence history records"""
-    records = db.query(ViolenceHistory).all()
+def get_violence_history(page: int = 1, page_size: int = 12, db: Session = Depends(get_db)):
+    """Get paginated violence history records"""
+    page = max(page, 1)
+    page_size = min(max(page_size, 1), 100)
+
+    query = (
+        db.query(ViolenceHistory, Camera)
+        .outerjoin(Camera, ViolenceHistory.CameraID == Camera.CameraID)
+        .order_by(ViolenceHistory.Timestamp.desc())
+    )
+    total = query.count()
+    records = query.offset((page - 1) * page_size).limit(page_size).all()
+
     return {
-        "count": len(records),
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "total_pages": (total + page_size - 1) // page_size,
         "data": [
             {
                 "HistoryID": v.HistoryID,
                 "Timestamp": v.Timestamp.isoformat() if v.Timestamp else None,
                 "Location": v.Location,
                 "ClipURL": v.ClipURL,
-                "Confidence": v.Confidence
-            } for v in records
+                "Confidence": v.Confidence,
+                "CameraID": v.CameraID,
+                "CameraName": c.CameraName if c else None,
+            } for v, c in records
         ]
     }
 
@@ -381,6 +534,8 @@ async def websocket_detection(websocket: WebSocket, camera_id: str):
 
             if isinstance(payload, dict):
                 payload.setdefault("camera_id", camera_id)
+                recording_started = await _handle_violence_detection(camera_id, payload)
+                payload["recording_started"] = recording_started
                 latest_detections[camera_id] = payload
                 # logger.info(
                 #     f"Detection received for camera {camera_id}: "

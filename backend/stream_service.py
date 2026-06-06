@@ -14,6 +14,8 @@ logger = logging.getLogger(__name__)
 # Store active streams: {camera_id: StreamBuffer}
 active_streams: dict = {}
 STREAM_BUFFER_SIZE = 30  # Keep last 30 frames
+recording_buffers: dict = {}
+MAX_RECORDING_SECONDS = int(os.getenv("MAX_RECORDING_SECONDS", "60"))
 
 
 class StreamBuffer:
@@ -53,8 +55,10 @@ class StreamBuffer:
                 # logger.info(f"Frame added successfully for {self.camera_id}, frame_count: {self.frame_count}")
             else:
                 logger.error(f"Failed to decode frame for {self.camera_id}")
+            return frame
         except Exception as e:
             logger.error(f"Error adding frame for camera {self.camera_id}: {e}")
+        return None
     
     def get_latest_frame(self) -> bytes:
         """Get latest frame as JPEG bytes"""
@@ -111,7 +115,9 @@ def add_frame_to_stream(camera_id: str, frame_data: bytes):
     """Add frame to camera stream"""
     # logger.info(f"Adding frame to stream {camera_id}, size: {len(frame_data)}")
     buffer = get_stream_buffer(camera_id)
-    buffer.add_frame(frame_data)
+    frame = buffer.add_frame(frame_data)
+    if frame is not None:
+        append_recording_frame(camera_id, frame)
 
 
 def get_stream_info(camera_id: str) -> dict:
@@ -146,3 +152,49 @@ def cleanup_inactive_streams(timeout_seconds: int = 60):
         del active_streams[camera_id]
     
     return len(inactive)
+
+
+class RecordingBuffer:
+    """Buffer to store frames for a violence clip"""
+
+    def __init__(self, camera_id: str, fps: int = 30, max_seconds: int = MAX_RECORDING_SECONDS):
+        self.camera_id = camera_id
+        self.fps = fps or 30
+        self.frames = deque(maxlen=self.fps * max_seconds)
+        self.lock = threading.Lock()
+        self.start_time = datetime.now()
+
+    def add_frame(self, frame):
+        with self.lock:
+            self.frames.append(frame)
+
+    def snapshot(self):
+        with self.lock:
+            return list(self.frames)
+
+
+def start_recording(camera_id: str, fps: int = None) -> RecordingBuffer:
+    """Start recording frames for a camera"""
+    buffer = get_stream_buffer(camera_id)
+    recording = RecordingBuffer(camera_id, fps=fps or buffer.fps)
+    recording_buffers[camera_id] = recording
+    return recording
+
+
+def append_recording_frame(camera_id: str, frame):
+    """Append a frame to the active recording buffer (if any)."""
+    recording = recording_buffers.get(camera_id)
+    if recording:
+        recording.add_frame(frame)
+
+
+def stop_recording(camera_id: str):
+    """Stop recording and return captured frames and metadata."""
+    recording = recording_buffers.pop(camera_id, None)
+    if not recording:
+        return None
+    return {
+        "frames": recording.snapshot(),
+        "fps": recording.fps,
+        "start_time": recording.start_time,
+    }

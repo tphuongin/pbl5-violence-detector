@@ -1,6 +1,7 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { apiService } from '../services/apiService';
 import VideoPlayer from '../components/VideoPlayer';
+import { ShieldAlert, AlertTriangle } from 'lucide-react';
 
 function CameraPage() {
   const [cameras, setCameras] = useState([]);
@@ -9,9 +10,70 @@ function CameraPage() {
   const [detectionUpdatedAt, setDetectionUpdatedAt] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const [toastMessage, setToastMessage] = useState('');
+  const [showToast, setShowToast] = useState(false);
+  const toastTimerRef = useRef(null);
+  const latestHistoryIdRef = useRef(null);
+  const historyCacheKey = 'violenceHistoryCacheV1';
 
   useEffect(() => {
     loadCameras();
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    let intervalId = null;
+
+    const checkHistory = async () => {
+      const data = await apiService.getViolenceHistory(1, 1);
+      if (!active) {
+        return;
+      }
+      const record = data?.data?.[0];
+      if (!record) {
+        return;
+      }
+
+      if (latestHistoryIdRef.current && record.HistoryID !== latestHistoryIdRef.current) {
+        const locationLabel = record.CameraName || record.Location || 'Không rõ vị trí';
+        setToastMessage(`Đã lưu vào lịch sử bạo lực: ${locationLabel}`);
+        setShowToast(true);
+        if (toastTimerRef.current) {
+          window.clearTimeout(toastTimerRef.current);
+        }
+        toastTimerRef.current = window.setTimeout(() => {
+          setShowToast(false);
+        }, 4500);
+
+        apiService.getViolenceHistory(1, 9).then((pageData) => {
+          if (pageData?.data) {
+            window.localStorage.setItem(
+              historyCacheKey,
+              JSON.stringify({
+                updatedAt: Date.now(),
+                records: pageData.data,
+                total: pageData.total || 0,
+              })
+            );
+          }
+        });
+      }
+
+      latestHistoryIdRef.current = record.HistoryID;
+    };
+
+    checkHistory();
+    intervalId = window.setInterval(checkHistory, 4000);
+
+    return () => {
+      active = false;
+      if (intervalId) {
+        window.clearInterval(intervalId);
+      }
+      if (toastTimerRef.current) {
+        window.clearTimeout(toastTimerRef.current);
+      }
+    };
   }, []);
 
   useEffect(() => {
@@ -63,9 +125,6 @@ function CameraPage() {
   const selectedCamera = cameras.find(c => c.CameraID === selectedCameraId);
   const isViolence = latestDetection?.label === 'VIOLENCE';
   const hasDetection = Boolean(latestDetection);
-  const thumbnailSrc = latestDetection?.thumb_b64
-    ? `data:image/jpeg;base64,${latestDetection.thumb_b64}`
-    : null;
 
   const formatProb = (value) => {
     if (typeof value !== 'number') {
@@ -86,7 +145,9 @@ function CameraPage() {
   if (loading) {
     return (
       <main className="page-shell">
-        <p>Đang tải dữ liệu...</p>
+        <div style={{ textAlign: 'center', padding: '40px 0', color: 'var(--muted)', fontWeight: '600' }}>
+          Đang tải dữ liệu...
+        </div>
       </main>
     );
   }
@@ -94,228 +155,190 @@ function CameraPage() {
   if (error) {
     return (
       <main className="page-shell">
-        <p style={{ color: 'red' }}>{error}</p>
+        <div style={{
+          backgroundColor: 'var(--danger-light)',
+          border: '1px solid var(--danger)',
+          borderRadius: '12px',
+          padding: '20px',
+          color: 'var(--danger)',
+          fontWeight: '600',
+          textAlign: 'center'
+        }}>{error}</div>
       </main>
     );
   }
 
   return (
     <main className="page-shell">
-      <div style={{ display: 'grid', gridTemplateColumns: '250px 1fr', gap: '20px', height: '100%' }}>
-        {/* Camera List */}
-        <section className="camera-card" aria-label="Danh sách camera">
-          <h3 style={{ marginTop: 0, marginBottom: '15px' }}>Cameras</h3>
-          {cameras.length === 0 ? (
-            <p>Không có camera nào</p>
-          ) : (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
-              {cameras.map((camera) => (
-                <button
-                  key={camera.CameraID}
-                  onClick={() => setSelectedCameraId(camera.CameraID)}
-                  style={{
-                    padding: '12px',
-                    border: selectedCameraId === camera.CameraID ? '2px solid #2196f3' : '1px solid #ddd',
-                    borderRadius: '6px',
-                    backgroundColor: selectedCameraId === camera.CameraID ? '#e3f2fd' : '#f9f9f9',
-                    cursor: 'pointer',
-                    textAlign: 'left',
-                    transition: 'all 0.3s ease',
-                  }}
-                >
-                  <div style={{ fontWeight: 'bold', fontSize: '0.95em' }}>
-                    {camera.CameraName}
-                  </div>
-                  <div style={{ fontSize: '0.8em', color: '#666', marginTop: '4px' }}>
-                    {camera.CameraStatus ? '✓ Online' : '✗ Offline'}
-                  </div>
-                </button>
-              ))}
+      <div className={`toast-stack ${showToast ? 'show' : ''}`}>
+        {toastMessage && (
+          <div 
+            className={`toast ${showToast ? 'show' : ''}`} 
+            role="status"
+          >
+            <div className="toast-icon-wrapper">
+              <AlertTriangle size={20} />
             </div>
-          )}
-        </section>
+            <div className="toast-content">
+              <div className="toast-title">Cảnh Báo Hệ Thống</div>
+              <div className="toast-desc">{toastMessage}</div>
+            </div>
+          </div>
+        )}
+      </div>
 
-        {/* Video Stream */}
-        <section>
-          {selectedCamera ? (
-            <div>
-              <h3 style={{ marginTop: 0, marginBottom: '15px' }}>
-                {selectedCamera.CameraName}
-              </h3>
-              <div className={`live-frame-shell ${isViolence ? 'danger' : 'safe'}`} style={{ marginBottom: '15px' }}>
-                {isViolence && (
-                  <div className="violence-alert-banner">
-                    CANH BAO: PHAT HIEN BAO LUC
-                  </div>
-                )}
-
-                <div className={`live-status-chip ${isViolence ? 'danger' : 'safe'}`}>
-                  {hasDetection ? (isViolence ? 'TRANG THAI: VIOLENCE' : 'TRANG THAI: NORMAL') : 'TRANG THAI: CHUA CO DU LIEU'}
+      <div style={{ maxWidth: '800px', margin: '0 auto' }}>
+        {/* Video Stream Main Area */}
+        {selectedCamera ? (
+          <div>
+            <h3 className="stream-title">
+              {selectedCamera.CameraName}
+            </h3>
+            
+            <div className={`live-frame-shell ${isViolence ? 'danger' : 'safe'}`} style={{ marginBottom: '20px' }}>
+              {isViolence && (
+                <div className="violence-alert-banner" style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <ShieldAlert size={16} />
+                  <span>PHÁT HIỆN BẠO LỰC</span>
                 </div>
+              )}
 
-                <VideoPlayer
-                  cameraId={selectedCamera.CameraID}
-                  cameraName={selectedCamera.CameraName}
-                />
+              <div className={`live-status-chip ${isViolence ? 'danger' : 'safe'}`}>
+                {hasDetection ? (isViolence ? 'VIOLENCE' : 'NORMAL') : 'CHƯA CÓ DỮ LIỆU'}
               </div>
 
-              <div style={{
-                backgroundColor: '#fff',
-                border: '1px solid #d9e2ec',
-                borderRadius: '12px',
-                padding: '16px',
-                marginBottom: '15px',
-              }}>
-                <div style={{
-                  display: 'flex',
-                  justifyContent: 'space-between',
-                  alignItems: 'center',
-                  marginBottom: '12px',
-                  flexWrap: 'wrap',
-                  gap: '10px',
-                }}>
-                  <h4 style={{ margin: 0 }}>Live Detection</h4>
-                  <span style={{
-                    backgroundColor: isViolence ? '#ffebee' : '#e8f5e9',
-                    color: isViolence ? '#c62828' : '#2e7d32',
-                    border: `1px solid ${isViolence ? '#ffcdd2' : '#c8e6c9'}`,
-                    borderRadius: '999px',
-                    padding: '6px 12px',
-                    fontSize: '0.85em',
-                    fontWeight: 'bold',
-                  }}>
-                    {latestDetection?.label || 'No Data'}
-                  </span>
-                </div>
+              <VideoPlayer
+                cameraId={selectedCamera.CameraID}
+                cameraName={selectedCamera.CameraName}
+              />
+            </div>
 
-                {!latestDetection ? (
-                  <p style={{ margin: 0, color: '#666' }}>
-                    Chưa có dữ liệu detection realtime từ Jetson cho camera này.
-                  </p>
-                ) : (
-                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 160px', gap: '14px' }}>
-                    <div style={{
-                      display: 'grid',
-                      gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))',
-                      gap: '10px',
-                    }}>
-                      {hasValue(latestDetection.timestamp) && (
-                        <div><strong>Timestamp:</strong> {latestDetection.timestamp}</div>
-                      )}
-                      {typeof latestDetection.prob_raw === 'number' && (
-                        <div><strong>Prob Raw:</strong> {formatProb(latestDetection.prob_raw)}</div>
-                      )}
-                      {typeof latestDetection.prob_smooth === 'number' && (
-                        <div><strong>Prob Smooth:</strong> {formatProb(latestDetection.prob_smooth)}</div>
-                      )}
-                      {(hasValue(latestDetection.confirm_count) || hasValue(latestDetection.confirm_needed)) && (
-                        <div><strong>Confirm:</strong> {latestDetection.confirm_count ?? '--'} / {latestDetection.confirm_needed ?? '--'}</div>
-                      )}
-                      {typeof latestDetection.threshold === 'number' && (
-                        <div><strong>Threshold:</strong> {formatNumber(latestDetection.threshold)}</div>
-                      )}
-                      {typeof latestDetection.conf_thresh === 'number' && (
-                        <div><strong>Conf Thresh:</strong> {formatNumber(latestDetection.conf_thresh)}</div>
-                      )}
-                      {typeof latestDetection.infer_fps === 'number' && (
-                        <div><strong>Infer FPS:</strong> {formatNumber(latestDetection.infer_fps, ' fps')}</div>
-                      )}
-                      {typeof latestDetection.cam_fps === 'number' && (
-                        <div><strong>Cam FPS:</strong> {formatNumber(latestDetection.cam_fps, ' fps')}</div>
-                      )}
-                      {typeof latestDetection.infer_ms === 'number' && (
-                        <div><strong>Infer Time:</strong> {formatNumber(latestDetection.infer_ms, ' ms')}</div>
-                      )}
-                      {typeof latestDetection.uptime === 'number' && (
-                        <div><strong>Uptime:</strong> {formatNumber(latestDetection.uptime, ' s')}</div>
-                      )}
-                      {typeof latestDetection.window_countdown === 'number' && (
-                        <div><strong>Window:</strong> {formatNumber(latestDetection.window_countdown, ' s')}</div>
-                      )}
-                      {typeof latestDetection.window_sec === 'number' && (
-                        <div><strong>Window Sec:</strong> {formatNumber(latestDetection.window_sec, ' s')}</div>
-                      )}
-                      {typeof latestDetection.alert_until === 'number' && (
-                        <div><strong>Alert Until:</strong> {formatNumber(latestDetection.alert_until, ' s')}</div>
-                      )}
-                      {typeof latestDetection.alert_sec === 'number' && (
-                        <div><strong>Alert Sec:</strong> {formatNumber(latestDetection.alert_sec, ' s')}</div>
-                      )}
-                      {typeof latestDetection.num_frames === 'number' && (
-                        <div><strong>Num Frames:</strong> {formatNumber(latestDetection.num_frames)}</div>
-                      )}
-                      <div><strong>Cập nhật:</strong> {detectionUpdatedAt ? new Date(detectionUpdatedAt).toLocaleTimeString('vi-VN') : '--'}</div>
+            {/* Realtime Detection Info Card */}
+            <div className="camera-card" style={{ marginBottom: '20px' }}>
+              <div className="live-detection-header">
+                <h4>Thông Số Nhận Diện Realtime</h4>
+                <span className={`detection-badge ${isViolence ? 'violence' : 'normal'}`}>
+                  {latestDetection?.label || 'Chờ Dữ Liệu'}
+                </span>
+              </div>
+
+              {!latestDetection ? (
+                <p className="detection-no-data">
+                  Đang đợi dữ liệu phân tích realtime từ thiết bị Jetson cho camera này...
+                </p>
+              ) : (
+                <div className="realtime-grid">
+                  {hasValue(latestDetection.timestamp) && (
+                    <div className="realtime-item">
+                      Thời gian <strong>{latestDetection.timestamp}</strong>
                     </div>
-
-                    <div style={{
-                      border: '1px solid #e0e0e0',
-                      borderRadius: '8px',
-                      overflow: 'hidden',
-                      backgroundColor: '#fafafa',
-                      minHeight: '90px',
-                    }}>
-                      {thumbnailSrc ? (
-                        <img
-                          src={thumbnailSrc}
-                          alt="Detection thumbnail"
-                          style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }}
-                        />
-                      ) : (
-                        <div style={{
-                          color: '#777',
-                          height: '100%',
-                          minHeight: '90px',
-                          display: 'flex',
-                          alignItems: 'center',
-                          justifyContent: 'center',
-                          textAlign: 'center',
-                          padding: '8px',
-                          fontSize: '0.85em',
-                        }}>
-                          No Thumbnail
-                        </div>
-                      )}
+                  )}
+                  {typeof latestDetection.prob_raw === 'number' && (
+                    <div className="realtime-item">
+                      Xác suất Gốc <strong>{formatProb(latestDetection.prob_raw)}</strong>
                     </div>
+                  )}
+                  {typeof latestDetection.prob_smooth === 'number' && (
+                    <div className="realtime-item">
+                      Xác suất Lọc <strong>{formatProb(latestDetection.prob_smooth)}</strong>
+                    </div>
+                  )}
+                  {(hasValue(latestDetection.confirm_count) || hasValue(latestDetection.confirm_needed)) && (
+                    <div className="realtime-item">
+                      Xác nhận <strong>{latestDetection.confirm_count ?? '--'} / {latestDetection.confirm_needed ?? '--'}</strong>
+                    </div>
+                  )}
+                  {typeof latestDetection.threshold === 'number' && (
+                    <div className="realtime-item">
+                      Ngưỡng Cảnh Báo <strong>{formatNumber(latestDetection.threshold)}</strong>
+                    </div>
+                  )}
+                  {typeof latestDetection.conf_thresh === 'number' && (
+                    <div className="realtime-item">
+                      Ngưỡng Tin Cậy <strong>{formatNumber(latestDetection.conf_thresh)}</strong>
+                    </div>
+                  )}
+                  {typeof latestDetection.infer_fps === 'number' && (
+                    <div className="realtime-item">
+                      FPS Phân Tích <strong>{formatNumber(latestDetection.infer_fps, ' fps')}</strong>
+                    </div>
+                  )}
+                  {typeof latestDetection.cam_fps === 'number' && (
+                    <div className="realtime-item">
+                      FPS Camera <strong>{formatNumber(latestDetection.cam_fps, ' fps')}</strong>
+                    </div>
+                  )}
+                  {typeof latestDetection.infer_ms === 'number' && (
+                    <div className="realtime-item">
+                      Thời Gian Xử Lý <strong>{formatNumber(latestDetection.infer_ms, ' ms')}</strong>
+                    </div>
+                  )}
+                  {typeof latestDetection.uptime === 'number' && (
+                    <div className="realtime-item">
+                      Uptime <strong>{formatNumber(latestDetection.uptime, ' s')}</strong>
+                    </div>
+                  )}
+                  {typeof latestDetection.window_countdown === 'number' && (
+                    <div className="realtime-item">
+                      Đếm Ngược Window <strong>{formatNumber(latestDetection.window_countdown, ' s')}</strong>
+                    </div>
+                  )}
+                  {typeof latestDetection.window_sec === 'number' && (
+                    <div className="realtime-item">
+                      Thời Gian Window <strong>{formatNumber(latestDetection.window_sec, ' s')}</strong>
+                    </div>
+                  )}
+                  {typeof latestDetection.alert_until === 'number' && (
+                    <div className="realtime-item">
+                      Giữ Cảnh Báo <strong>{formatNumber(latestDetection.alert_until, ' s')}</strong>
+                    </div>
+                  )}
+                  {typeof latestDetection.alert_sec === 'number' && (
+                    <div className="realtime-item">
+                      Thời Gian Cảnh Báo <strong>{formatNumber(latestDetection.alert_sec, ' s')}</strong>
+                    </div>
+                  )}
+                  {typeof latestDetection.num_frames === 'number' && (
+                    <div className="realtime-item">
+                      Số Frame <strong>{formatNumber(latestDetection.num_frames)}</strong>
+                    </div>
+                  )}
+                  <div className="realtime-item">
+                    Cập Nhật Lúc <strong>{detectionUpdatedAt ? new Date(detectionUpdatedAt).toLocaleTimeString('vi-VN') : '--'}</strong>
                   </div>
-                )}
+                </div>
+              )}
+            </div>
+            
+            {/* Camera Metadata Card */}
+            <div className="camera-details-card">
+              <div className="camera-details-item">
+                <span>Địa chỉ IP</span>
+                <strong>{selectedCamera.CameraIP}</strong>
               </div>
-              
-              {/* Camera Details */}
-              <div style={{
-                backgroundColor: '#f5f5f5',
-                padding: '15px',
-                borderRadius: '8px',
-                fontSize: '0.9em',
-              }}>
-                <div style={{ marginBottom: '8px' }}>
-                  <strong>IP Address:</strong> {selectedCamera.CameraIP}
-                </div>
-                <div style={{ marginBottom: '8px' }}>
-                  <strong>Phone:</strong> {selectedCamera.CameraPhoneNum}
-                </div>
-                <div style={{ marginBottom: '8px' }}>
-                  <strong>Status:</strong> {' '}
-                  <span style={{
-                    color: selectedCamera.CameraStatus ? '#4caf50' : '#f44336',
-                    fontWeight: 'bold'
-                  }}>
-                    {selectedCamera.CameraStatus ? '🟢 Online' : '🔴 Offline'}
-                  </span>
-                </div>
+              <div className="camera-details-item">
+                <span>Số điện thoại nhận cảnh báo</span>
+                <strong>{selectedCamera.CameraPhoneNum}</strong>
+              </div>
+              <div className="camera-details-item">
+                <span>Trạng thái kết nối</span>
+                <strong style={{ color: selectedCamera.CameraStatus ? 'var(--success)' : 'var(--danger)' }}>
+                  {selectedCamera.CameraStatus ? '● Trực tuyến' : '○ Ngoại tuyến'}
+                </strong>
               </div>
             </div>
-          ) : (
-            <div style={{
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              height: '100%',
-              color: '#999',
-            }}>
-              <p>Chọn một camera để xem stream</p>
-            </div>
-          )}
-        </section>
+          </div>
+        ) : (
+          <div className="camera-card" style={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            minHeight: '350px',
+            color: 'var(--muted)',
+          }}>
+            <p style={{ margin: 0, fontWeight: '600' }}>Không tìm thấy camera hoạt động nào</p>
+          </div>
+        )}
       </div>
     </main>
   );

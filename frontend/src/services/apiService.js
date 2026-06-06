@@ -50,14 +50,18 @@ export const apiService = {
   },
 
   // Violence History
-  getViolenceHistory: async () => {
+  getViolenceHistory: async (page = 1, pageSize = 12) => {
     try {
-      const response = await fetch(`${API_BASE_URL}/violence-history`);
+      const params = new URLSearchParams({
+        page: String(page),
+        page_size: String(pageSize),
+      });
+      const response = await fetch(`${API_BASE_URL}/violence-history?${params.toString()}`);
       if (!response.ok) throw new Error('Failed to fetch violence history');
       return await response.json();
     } catch (error) {
       console.error('Error fetching violence history:', error);
-      return { count: 0, data: [] };
+      return { total: 0, data: [] };
     }
   },
 

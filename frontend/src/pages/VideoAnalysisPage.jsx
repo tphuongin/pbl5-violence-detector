@@ -1,5 +1,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { apiService, WS_BASE_URL } from '../services/apiService';
+import { 
+  UploadCloud, 
+  FileVideo, 
+  Trash2, 
+  AlertCircle, 
+  CheckCircle2, 
+  AlertOctagon, 
+  Activity, 
+  Film, 
+  Clock, 
+  Percent, 
+  Cpu 
+} from 'lucide-react';
 import './VideoAnalysisPage.css';
 
 const MAX_FILE_MB = 500;
@@ -390,15 +403,16 @@ function VideoAnalysisPage() {
 
   return (
     <main className="page-shell">
-      <section className="video-analysis-section">
-        <div className="video-analysis-header">
-          <h1>Phân tích video</h1>
-          <p className="subtitle">Chọn video bạn muốn phân tích</p>
-        </div>
+      <div className="page-banner">
+        <h1>Phân tích Video Offline</h1>
+        <p>Tải lên video để AI phân tích toàn bộ khung hình, vẽ biểu đồ timeline xác suất bạo lực và bóc tách các phân đoạn sự cố.</p>
+      </div>
 
+      <section className="video-analysis-section">
         <div className="video-analysis-container">
           {analysis.status === 'error' && (
-            <div className="error-panel">
+            <div className="error-panel" style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', textAlign: 'center' }}>
+              <AlertCircle size={32} style={{ color: 'var(--danger)', marginBottom: '10px' }} />
               <div className="error-title">Có lỗi xảy ra</div>
               <p>{analysis.error || 'Không thể phân tích video'}</p>
               <div className="error-actions">
@@ -440,7 +454,7 @@ function VideoAnalysisPage() {
                   onChange={handleVideoChange}
                   style={{ display: 'none' }}
                 />
-                <div className="upload-icon">📹</div>
+                <UploadCloud size={48} className="upload-icon" style={{ color: 'var(--primary)', marginBottom: '12px' }} />
                 <div className="upload-text">
                   <p className="upload-title">Chọn hoặc kéo thả video</p>
                   <p className="upload-hint">MP4, AVI, MOV, MKV - tối đa 500MB</p>
@@ -450,7 +464,7 @@ function VideoAnalysisPage() {
               <div className="video-selected">
                 <div className="video-info">
                   <div className="video-icon-wrapper">
-                    <div className="video-icon">📹</div>
+                    <FileVideo size={20} style={{ color: 'var(--primary)' }} />
                   </div>
                   <div className="video-details">
                     <p className="video-name">{selectedVideo.name}</p>
@@ -465,7 +479,7 @@ function VideoAnalysisPage() {
                   title="Xóa video"
                   disabled={isWorking}
                 >
-                  ✕
+                  <Trash2 size={16} />
                 </button>
               </div>
             )}
@@ -540,7 +554,10 @@ function VideoAnalysisPage() {
 
               <div className="timeline-card">
                 <div className="timeline-header">
-                  <h4>Timeline xác suất</h4>
+                  <h4 style={{ display: 'flex', alignItems: 'center', gap: '6px', margin: 0 }}>
+                    <Activity size={16} style={{ color: 'var(--primary)' }} />
+                    <span>Timeline xác suất</span>
+                  </h4>
                   <span>{formatVideoTime(chartMeta.maxTime)}s</span>
                 </div>
                 {renderChart()}
@@ -550,38 +567,67 @@ function VideoAnalysisPage() {
 
           {analysis.status === 'done' && analysis.summary && (
             <div className="summary-card">
-              <div className={`verdict ${analysis.summary.verdict === 'VIOLENCE' ? 'danger' : 'safe'}`}>
-                {analysis.summary.verdict === 'VIOLENCE'
-                  ? '⚠ PHÁT HIỆN BẠO LỰC'
-                  : '✓ BÌNH THƯỜNG'}
+              <div 
+                className={`verdict ${analysis.summary.verdict === 'VIOLENCE' ? 'danger' : 'safe'}`}
+                style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px' }}
+              >
+                {analysis.summary.verdict === 'VIOLENCE' ? (
+                  <>
+                    <AlertOctagon size={20} />
+                    <span>PHÁT HIỆN BẠO LỰC</span>
+                  </>
+                ) : (
+                  <>
+                    <CheckCircle2 size={20} />
+                    <span>BÌNH THƯỜNG</span>
+                  </>
+                )}
               </div>
 
               <div className="summary-grid">
                 <div>
-                  <span>Tổng frames</span>
+                  <span style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                    <Film size={14} />
+                    Tổng frames
+                  </span>
                   <strong>{analysis.summary.total_frames}</strong>
                 </div>
                 <div>
-                  <span>Thời lượng</span>
+                  <span style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                    <Clock size={14} />
+                    Thời lượng
+                  </span>
                   <strong>{analysis.summary.video_duration_s.toFixed(1)}s</strong>
                 </div>
                 <div>
-                  <span>Tỉ lệ bạo lực</span>
+                  <span style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                    <Percent size={14} />
+                    Tỉ lệ bạo lực
+                  </span>
                   <strong>{(analysis.summary.violence_ratio * 100).toFixed(1)}%</strong>
                 </div>
                 <div>
-                  <span>Xác suất cao nhất</span>
+                  <span style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                    <Activity size={14} />
+                    Xác suất cao nhất
+                  </span>
                   <strong>{(analysis.summary.max_prob * 100).toFixed(1)}%</strong>
                 </div>
                 <div>
-                  <span>Thời gian xử lý</span>
+                  <span style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                    <Cpu size={14} />
+                    Thời gian xử lý
+                  </span>
                   <strong>{analysis.summary.processing_time_s.toFixed(1)}s</strong>
                 </div>
               </div>
 
               <div className="timeline-card">
                 <div className="timeline-header">
-                  <h4>Timeline xác suất</h4>
+                  <h4 style={{ display: 'flex', alignItems: 'center', gap: '6px', margin: 0 }}>
+                    <Activity size={16} style={{ color: 'var(--primary)' }} />
+                    <span>Timeline xác suất</span>
+                  </h4>
                   <span>{formatVideoTime(chartMeta.maxTime)}s</span>
                 </div>
                 {renderChart()}
