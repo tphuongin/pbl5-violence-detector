@@ -37,6 +37,9 @@ WS_STREAM_URL    = f"ws://{BACKEND_HOST}:{BACKEND_PORT}/ws/stream/{CAMERA_ID}"
 WS_DETECTION_URL = f"ws://{BACKEND_HOST}:{BACKEND_PORT}/ws/detection/{CAMERA_ID}"
 RECONNECT_DELAY  = 3
 
+import threading
+web_reset_event = threading.Event()
+
 # ── Jetson HTTP server (nhận video từ backend) ────────────
 JETSON_HTTP_HOST = "0.0.0.0"
 JETSON_HTTP_PORT = 8001
@@ -1044,10 +1047,13 @@ def run_inference(cam: CameraCapture,
                 frame_event.wait(timeout=0.1)
                 continue
 
-            # ── [THÊM MỚI] XỬ LÝ KHI NÚT ĐƯỢC BẤM ────────────────────────
-            if manual_reset_event.is_set():
+            # ── [THÊM MỚI] XỬ LÝ KHI NÚT ĐƯỢC BẤM HOẶC CÓ YÊU CẦU TỪ WEB ──
+            if manual_reset_event.is_set() or web_reset_event.is_set():
+                is_web = web_reset_event.is_set()
                 manual_reset_event.clear()
-                logger.warning("[Button] 🛑 ĐÃ BẤM NÚT! Tắt còi, hủy gọi điện, ép reset AI.")
+                web_reset_event.clear()
+                trigger_source = "Web UI" if is_web else "Hardware Button"
+                logger.warning(f"[{trigger_source}] 🛑 ĐÃ NHẬN YÊU CẦU RESET! Tắt còi, hủy gọi điện, ép reset AI.")
 
                 # Đập tan trí nhớ của model
                 model.reset_states()
@@ -1068,7 +1074,7 @@ def run_inference(cam: CameraCapture,
 
                 # "Mù tạm thời" 5 giây — tránh còi rú lại ngay khi chưa thoát khỏi khung bạo lực
                 force_mute_until = now + 5.0
-                logger.info("[Button] Hệ thống tạm dừng phân tích trong 5 giây.")
+                logger.info(f"[{trigger_source}] Hệ thống tạm dừng phân tích trong 5 giây.")
 
             # Nếu đang trong thời gian "mù" do vừa bấm nút, bỏ qua frame này
             if now < force_mute_until:
@@ -1353,10 +1359,16 @@ def build_http_app(job_registry: JobRegistry,
         job.cancel()
         return web.json_response({"cancelled": True, "job_id": job.job_id})
 
+    async def handle_mute(request: web.Request) -> web.Response:
+        logger.warning("[HTTP] 🛑 Yêu cầu tắt còi thủ công từ Web UI!")
+        web_reset_event.set()
+        return web.json_response({"success": True, "message": "Đã gửi yêu cầu tắt còi thủ công"})
+
     app = web.Application(client_max_size=MAX_VIDEO_SIZE_MB * 1024 * 1024 + 1024)
     app.router.add_post("/analyze-video", handle_analyze_video)
     app.router.add_get("/status",         handle_status)
     app.router.add_post("/cancel",        handle_cancel)
+    app.router.add_post("/mute",          handle_mute)
     return app
 
 async def main():

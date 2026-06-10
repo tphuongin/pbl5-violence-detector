@@ -132,6 +132,22 @@ export const apiService = {
     }
   },
 
+  muteCameraBuzzer: async (cameraId) => {
+    try {
+      const response = await authFetch(`${API_BASE_URL}/cameras/${cameraId}/mute`, {
+        method: 'POST',
+      });
+      if (!response.ok) {
+        const errData = await response.json();
+        throw new Error(errData.detail || 'Không thể tắt còi');
+      }
+      return await response.json();
+    } catch (error) {
+      console.error('Error muting camera buzzer:', error);
+      throw error;
+    }
+  },
+
   getLatestDetection: async (cameraId) => {
     try {
       const response = await authFetch(`${API_BASE_URL}/detection/${cameraId}/latest`);

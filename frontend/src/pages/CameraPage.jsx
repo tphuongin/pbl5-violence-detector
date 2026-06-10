@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { apiService } from '../services/apiService';
 import VideoPlayer from '../components/VideoPlayer';
-import { ShieldAlert, AlertTriangle, Plus, Edit2, Trash2, X, AlertCircle } from 'lucide-react';
+import { ShieldAlert, AlertTriangle, Plus, Edit2, Trash2, X, AlertCircle, VolumeX } from 'lucide-react';
 import './CameraPage.css';
 
 function CameraPage() {
@@ -30,6 +30,7 @@ function CameraPage() {
   });
   const [modalError, setModalError] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isMuting, setIsMuting] = useState(false);
 
   const handleOpenAddModal = () => {
     setModalData({
@@ -104,6 +105,25 @@ function CameraPage() {
       }
     } catch (err) {
       alert(err.message || 'Không thể xóa camera');
+    }
+  };
+
+  const handleMuteBuzzer = async (cameraId) => {
+    setIsMuting(true);
+    try {
+      await apiService.muteCameraBuzzer(cameraId);
+      setToastMessage('Đã gửi yêu cầu tắt còi báo động thành công!');
+      setShowToast(true);
+      if (toastTimerRef.current) {
+        window.clearTimeout(toastTimerRef.current);
+      }
+      toastTimerRef.current = window.setTimeout(() => {
+        setShowToast(false);
+      }, 4500);
+    } catch (err) {
+      alert(err.message || 'Không thể tắt còi báo động');
+    } finally {
+      setIsMuting(false);
     }
   };
 
@@ -347,9 +367,21 @@ function CameraPage() {
               
               <div className={`live-frame-shell ${isViolence ? 'danger' : 'safe'}`} style={{ marginBottom: '20px' }}>
                 {isViolence && (
-                  <div className="violence-alert-banner" style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                    <ShieldAlert size={16} />
-                    <span>PHÁT HIỆN BẠO LỰC</span>
+                  <div className="violence-alert-banner" style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                      <ShieldAlert size={16} />
+                      <span>PHÁT HIỆN BẠO LỰC</span>
+                    </div>
+                    <div style={{ width: '1px', height: '14px', background: 'rgba(255, 255, 255, 0.4)' }}></div>
+                    <button
+                      className="banner-mute-btn"
+                      onClick={() => handleMuteBuzzer(selectedCamera.CameraID)}
+                      disabled={isMuting}
+                      title="Tắt còi báo động"
+                    >
+                      <VolumeX size={14} />
+                      <span>{isMuting ? 'Đang tắt...' : 'Tắt còi'}</span>
+                    </button>
                   </div>
                 )}
 
@@ -367,9 +399,20 @@ function CameraPage() {
               <div className="camera-card" style={{ marginBottom: '20px' }}>
                 <div className="live-detection-header">
                   <h4>Thông Số Nhận Diện Realtime</h4>
-                  <span className={`detection-badge ${isViolence ? 'violence' : 'normal'}`}>
-                    {latestDetection?.label || 'Chờ Dữ Liệu'}
-                  </span>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                    <button
+                      className="mute-buzzer-btn-card"
+                      onClick={() => handleMuteBuzzer(selectedCamera.CameraID)}
+                      disabled={isMuting}
+                      title="Tắt còi báo động thủ công cho camera này"
+                    >
+                      <VolumeX size={14} />
+                      <span>{isMuting ? 'Đang tắt...' : 'Tắt còi thủ công'}</span>
+                    </button>
+                    <span className={`detection-badge ${isViolence ? 'violence' : 'normal'}`}>
+                      {latestDetection?.label || 'Chờ Dữ Liệu'}
+                    </span>
+                  </div>
                 </div>
 
                 {!latestDetection ? (

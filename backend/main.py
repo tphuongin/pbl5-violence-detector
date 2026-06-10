@@ -399,6 +399,38 @@ def delete_camera(camera_id: str, db: Session = Depends(get_db), current_user: d
     db.commit()
     return {"success": True}
 
+@app.post("/api/cameras/{camera_id}/mute")
+async def mute_camera_buzzer(camera_id: str, db: Session = Depends(get_db), current_user: dict = Depends(get_current_user)):
+    """Send a request to the Jetson client to turn off the buzzer/siren (Mute)."""
+    camera = db.query(Camera).filter(Camera.CameraID == camera_id).first()
+    if not camera:
+        raise HTTPException(status_code=404, detail="Không tìm thấy thông tin camera")
+    
+    if not camera.CameraIP:
+        raise HTTPException(status_code=400, detail="Camera này không cấu hình địa chỉ IP")
+    
+    jetson_url = f"http://{camera.CameraIP}:{JETSON_HTTP_PORT}/mute"
+    
+    try:
+        timeout = httpx.Timeout(5.0, connect=2.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(jetson_url)
+            if response.status_code == 200:
+                return response.json()
+            else:
+                try:
+                    err_json = response.json()
+                    detail = err_json.get("error") or response.text
+                except Exception:
+                    detail = response.text
+                raise HTTPException(status_code=response.status_code, detail=detail)
+    except httpx.ConnectError:
+        raise HTTPException(status_code=503, detail="Không thể kết nối đến thiết bị Jetson của camera này (IP: " + camera.CameraIP + ")")
+    except httpx.ReadTimeout:
+        raise HTTPException(status_code=504, detail="Thiết bị Jetson phản hồi quá lâu")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi khi gửi yêu cầu tắt còi: {str(e)}")
+
 # ============= VIOLENCE HISTORY ENDPOINTS =============
 @app.get("/api/violence-history")
 def get_violence_history(page: int = 1, page_size: int = 12, db: Session = Depends(get_db), current_user: dict = Depends(get_current_user)):
