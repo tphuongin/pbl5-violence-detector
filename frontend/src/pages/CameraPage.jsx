@@ -367,21 +367,9 @@ function CameraPage() {
               
               <div className={`live-frame-shell ${isViolence ? 'danger' : 'safe'}`} style={{ marginBottom: '20px' }}>
                 {isViolence && (
-                  <div className="violence-alert-banner" style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                      <ShieldAlert size={16} />
-                      <span>PHÁT HIỆN BẠO LỰC</span>
-                    </div>
-                    <div style={{ width: '1px', height: '14px', background: 'rgba(255, 255, 255, 0.4)' }}></div>
-                    <button
-                      className="banner-mute-btn"
-                      onClick={() => handleMuteBuzzer(selectedCamera.CameraID)}
-                      disabled={isMuting}
-                      title="Tắt còi báo động"
-                    >
-                      <VolumeX size={14} />
-                      <span>{isMuting ? 'Đang tắt...' : 'Tắt còi'}</span>
-                    </button>
+                  <div className="violence-alert-banner" style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <ShieldAlert size={16} />
+                    <span>PHÁT HIỆN BẠO LỰC</span>
                   </div>
                 )}
 
@@ -393,26 +381,25 @@ function CameraPage() {
                   cameraId={selectedCamera.CameraID}
                   cameraName={selectedCamera.CameraName}
                 />
+
+                <button
+                  className={`absolute-mute-btn ${isViolence ? 'active-alarm' : ''}`}
+                  onClick={() => handleMuteBuzzer(selectedCamera.CameraID)}
+                  disabled={isMuting}
+                  title="Tắt còi báo động khẩn cấp"
+                >
+                  <VolumeX size={15} />
+                  <span>{isMuting ? 'Đang tắt...' : 'Tắt còi'}</span>
+                </button>
               </div>
 
               {/* Realtime Detection Info Card */}
               <div className="camera-card" style={{ marginBottom: '20px' }}>
                 <div className="live-detection-header">
                   <h4>Thông Số Nhận Diện Realtime</h4>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-                    <button
-                      className="mute-buzzer-btn-card"
-                      onClick={() => handleMuteBuzzer(selectedCamera.CameraID)}
-                      disabled={isMuting}
-                      title="Tắt còi báo động thủ công cho camera này"
-                    >
-                      <VolumeX size={14} />
-                      <span>{isMuting ? 'Đang tắt...' : 'Tắt còi thủ công'}</span>
-                    </button>
-                    <span className={`detection-badge ${isViolence ? 'violence' : 'normal'}`}>
-                      {latestDetection?.label || 'Chờ Dữ Liệu'}
-                    </span>
-                  </div>
+                  <span className={`detection-badge ${isViolence ? 'violence' : 'normal'}`}>
+                    {latestDetection?.label || 'Chờ Dữ Liệu'}
+                  </span>
                 </div>
 
                 {!latestDetection ? (
