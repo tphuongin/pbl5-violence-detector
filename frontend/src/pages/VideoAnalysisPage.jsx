@@ -74,7 +74,8 @@ function useVideoAnalysisSocket(jobId, enabled, onMessage, onStatus) {
     let closedManually = false;
 
     const connect = () => {
-      socket = new WebSocket(`${WS_BASE_URL}/ws/video-analysis/${jobId}`);
+      const token = localStorage.getItem('token');
+      socket = new WebSocket(`${WS_BASE_URL}/ws/video-analysis/${jobId}?token=${token}`);
 
       socket.onopen = () => {
         lastMessageAtRef.current = Date.now();

@@ -7,12 +7,57 @@ export const WS_BASE_URL = API_BASE_URL
 
 console.log('API Base URL:', API_BASE_URL);
 
+// Helper for authenticated requests
+export const authFetch = async (url, options = {}) => {
+  const token = localStorage.getItem('token');
+  const headers = { ...options.headers };
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`;
+  }
+  return fetch(url, { ...options, headers });
+};
+
 export const apiService = {
+  // Auth
+  login: async (username, password) => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/auth/login`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ username, password }),
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.detail || 'Đăng nhập thất bại');
+      }
+      return data;
+    } catch (error) {
+      console.error('Error during login:', error);
+      throw error;
+    }
+  },
+
+  logout: async () => {
+    try {
+      await authFetch(`${API_BASE_URL}/auth/logout`, {
+        method: 'POST',
+      });
+    } catch (error) {
+      console.error('Error during logout:', error);
+    } finally {
+      localStorage.removeItem('token');
+      localStorage.removeItem('username');
+      localStorage.removeItem('userId');
+    }
+  },
+
   // Cameras
   getCameras: async () => {
     try {
       console.log('Fetching cameras from:', `${API_BASE_URL}/cameras`);
-      const response = await fetch(`${API_BASE_URL}/cameras`);
+      const response = await authFetch(`${API_BASE_URL}/cameras`);
       console.log('Cameras response status:', response.status);
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const data = await response.json();
@@ -26,7 +71,7 @@ export const apiService = {
 
   getCameraById: async (cameraId) => {
     try {
-      const response = await fetch(`${API_BASE_URL}/cameras/${cameraId}`);
+      const response = await authFetch(`${API_BASE_URL}/cameras/${cameraId}`);
       if (!response.ok) throw new Error('Failed to fetch camera');
       return await response.json();
     } catch (error) {
@@ -37,7 +82,7 @@ export const apiService = {
 
   getLatestDetection: async (cameraId) => {
     try {
-      const response = await fetch(`${API_BASE_URL}/detection/${cameraId}/latest`);
+      const response = await authFetch(`${API_BASE_URL}/detection/${cameraId}/latest`);
       if (response.status === 404) {
         return null;
       }
@@ -56,7 +101,7 @@ export const apiService = {
         page: String(page),
         page_size: String(pageSize),
       });
-      const response = await fetch(`${API_BASE_URL}/violence-history?${params.toString()}`);
+      const response = await authFetch(`${API_BASE_URL}/violence-history?${params.toString()}`);
       if (!response.ok) throw new Error('Failed to fetch violence history');
       return await response.json();
     } catch (error) {
@@ -67,7 +112,7 @@ export const apiService = {
 
   getViolenceById: async (historyId) => {
     try {
-      const response = await fetch(`${API_BASE_URL}/violence-history/${historyId}`);
+      const response = await authFetch(`${API_BASE_URL}/violence-history/${historyId}`);
       if (!response.ok) throw new Error('Failed to fetch violence record');
       return await response.json();
     } catch (error) {
@@ -79,7 +124,7 @@ export const apiService = {
   // Users
   getUsers: async () => {
     try {
-      const response = await fetch(`${API_BASE_URL}/users`);
+      const response = await authFetch(`${API_BASE_URL}/users`);
       if (!response.ok) throw new Error('Failed to fetch users');
       return await response.json();
     } catch (error) {
@@ -91,7 +136,7 @@ export const apiService = {
   // Calls
   getCalls: async () => {
     try {
-      const response = await fetch(`${API_BASE_URL}/calls`);
+      const response = await authFetch(`${API_BASE_URL}/calls`);
       if (!response.ok) throw new Error('Failed to fetch calls');
       return await response.json();
     } catch (error) {
@@ -104,7 +149,7 @@ export const apiService = {
     const formData = new FormData();
     formData.append('video', file);
 
-    const response = await fetch(`${API_BASE_URL}/analyze-video`, {
+    const response = await authFetch(`${API_BASE_URL}/analyze-video`, {
       method: 'POST',
       body: formData,
     });
@@ -120,7 +165,7 @@ export const apiService = {
   },
 
   getVideoAnalysisStatus: async (jobId) => {
-    const response = await fetch(`${API_BASE_URL}/video-analysis/${jobId}/status`);
+    const response = await authFetch(`${API_BASE_URL}/video-analysis/${jobId}/status`);
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}`);
     }
@@ -128,7 +173,7 @@ export const apiService = {
   },
 
   cancelVideoAnalysis: async (jobId) => {
-    const response = await fetch(`${API_BASE_URL}/video-analysis/${jobId}/cancel`, {
+    const response = await authFetch(`${API_BASE_URL}/video-analysis/${jobId}/cancel`, {
       method: 'POST',
     });
     if (!response.ok) {

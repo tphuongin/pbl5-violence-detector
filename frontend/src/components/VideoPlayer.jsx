@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
+import { WS_BASE_URL } from '../services/apiService';
 
 function VideoPlayer({ cameraId, cameraName }) {
   const [isConnected, setIsConnected] = useState(false);
@@ -12,7 +13,8 @@ function VideoPlayer({ cameraId, cameraName }) {
     setIsConnected(false);
 
     const connectWebSocket = () => {
-      const wsUrl = `ws://192.168.137.1:8000/ws/view/${cameraId}`;
+      const token = localStorage.getItem('token');
+      const wsUrl = `${WS_BASE_URL}/ws/view/${cameraId}?token=${token}`;
       wsRef.current = new WebSocket(wsUrl);
 
       wsRef.current.onopen = () => {

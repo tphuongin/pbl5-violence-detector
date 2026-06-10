@@ -32,6 +32,28 @@ load_dotenv()
 # Initialize database tables
 init_db()
 
+from pydantic import BaseModel
+import uuid
+import hashlib
+
+# In-memory session store
+active_sessions: Dict[str, dict] = {}
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+def get_current_user(request: Request):
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Bạn chưa đăng nhập hoặc phiên làm việc đã hết hạn")
+    
+    token = auth_header.split(" ")[1]
+    if token not in active_sessions:
+        raise HTTPException(status_code=401, detail="Phiên làm việc không hợp lệ")
+    
+    return active_sessions[token]
+
 # Create FastAPI app
 app = FastAPI(
     title="PBL5 Violence Detector API",
@@ -239,9 +261,38 @@ app.add_middleware(
 def health_check():
     return {"status": "ok", "message": "API is running"}
 
+# ============= AUTH ENDPOINTS =============
+@app.post("/api/auth/login")
+def login(data: LoginRequest, db: Session = Depends(get_db)):
+    hashed = hashlib.sha256(data.password.encode()).hexdigest()
+    user = db.query(User).filter(User.Username == data.username).first()
+    if not user or user.PasswordHash != hashed:
+        raise HTTPException(status_code=401, detail="Tên đăng nhập hoặc mật khẩu không chính xác")
+    
+    token = uuid.uuid4().hex
+    user_info = {
+        "UserID": user.UserID,
+        "Username": user.Username
+    }
+    active_sessions[token] = user_info
+    return {
+        "success": True,
+        "token": token,
+        "user": user_info
+    }
+
+@app.post("/api/auth/logout")
+def logout(request: Request):
+    auth_header = request.headers.get("Authorization")
+    if auth_header and auth_header.startswith("Bearer "):
+        token = auth_header.split(" ")[1]
+        if token in active_sessions:
+            del active_sessions[token]
+    return {"success": True}
+
 # ============= USER ENDPOINTS =============
 @app.get("/api/users")
-def get_users(db: Session = Depends(get_db)):
+def get_users(db: Session = Depends(get_db), current_user: dict = Depends(get_current_user)):
     """Get all users"""
     users = db.query(User).all()
     return {
@@ -256,7 +307,7 @@ def get_users(db: Session = Depends(get_db)):
 
 # ============= CAMERA ENDPOINTS =============
 @app.get("/api/cameras")
-def get_cameras(db: Session = Depends(get_db)):
+def get_cameras(db: Session = Depends(get_db), current_user: dict = Depends(get_current_user)):
     """Get all cameras"""
     cameras = db.query(Camera).all()
     return {
@@ -273,7 +324,7 @@ def get_cameras(db: Session = Depends(get_db)):
     }
 
 @app.get("/api/cameras/{camera_id}")
-def get_camera_by_id(camera_id: str, db: Session = Depends(get_db)):
+def get_camera_by_id(camera_id: str, db: Session = Depends(get_db), current_user: dict = Depends(get_current_user)):
     """Get camera by ID"""
     camera = db.query(Camera).filter(Camera.CameraID == camera_id).first()
     if not camera:
@@ -288,7 +339,7 @@ def get_camera_by_id(camera_id: str, db: Session = Depends(get_db)):
 
 # ============= VIOLENCE HISTORY ENDPOINTS =============
 @app.get("/api/violence-history")
-def get_violence_history(page: int = 1, page_size: int = 12, db: Session = Depends(get_db)):
+def get_violence_history(page: int = 1, page_size: int = 12, db: Session = Depends(get_db), current_user: dict = Depends(get_current_user)):
     """Get paginated violence history records"""
     page = max(page, 1)
     page_size = min(max(page_size, 1), 100)
@@ -320,7 +371,7 @@ def get_violence_history(page: int = 1, page_size: int = 12, db: Session = Depen
     }
 
 @app.get("/api/violence-history/{history_id}")
-def get_violence_by_id(history_id: str, db: Session = Depends(get_db)):
+def get_violence_by_id(history_id: str, db: Session = Depends(get_db), current_user: dict = Depends(get_current_user)):
     """Get violence record by ID"""
     record = db.query(ViolenceHistory).filter(ViolenceHistory.HistoryID == history_id).first()
     if not record:
@@ -335,7 +386,7 @@ def get_violence_by_id(history_id: str, db: Session = Depends(get_db)):
 
 # ============= CALLS ENDPOINTS =============
 @app.get("/api/calls")
-def get_calls(db: Session = Depends(get_db)):
+def get_calls(db: Session = Depends(get_db), current_user: dict = Depends(get_current_user)):
     """Get all calls"""
     calls = db.query(Call).all()
     return {
@@ -350,7 +401,7 @@ def get_calls(db: Session = Depends(get_db)):
 
 # ============= UPLOAD ENDPOINTS =============
 @app.post("/api/upload/image")
-async def upload_image(file: UploadFile = File(...)):
+async def upload_image(file: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
     """Upload image to Cloudinary"""
     try:
         # Save file temporarily
@@ -374,7 +425,7 @@ async def upload_image(file: UploadFile = File(...)):
         return {"success": False, "error": str(e)}
 
 @app.post("/api/upload/video")
-async def upload_video(file: UploadFile = File(...)):
+async def upload_video(file: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
     """Upload video to Cloudinary"""
     try:
         # Save file temporarily
@@ -401,7 +452,8 @@ async def upload_video(file: UploadFile = File(...)):
 async def upload_violence_clip(
     file: UploadFile = File(...),
     location: str = "Unknown",
-    timestamp: str = None
+    timestamp: str = None,
+    current_user: dict = Depends(get_current_user)
 ):
     """Upload violence detection clip to Cloudinary"""
     try:
@@ -430,7 +482,7 @@ async def upload_violence_clip(
         return {"success": False, "error": str(e)}
 
 @app.delete("/api/upload/{public_id}")
-def delete_file(public_id: str, resource_type: str = "image"):
+def delete_file(public_id: str, resource_type: str = "image", current_user: dict = Depends(get_current_user)):
     """Delete file from Cloudinary"""
     return upload_service.delete_file(public_id, resource_type)
 
@@ -499,6 +551,11 @@ async def websocket_stream(websocket: WebSocket, camera_id: str):
 @app.websocket("/ws/view/{camera_id}")
 async def view_stream(websocket: WebSocket, camera_id: str):
     """WebSocket endpoint for viewing video stream"""
+    token = websocket.query_params.get("token")
+    if not token or token not in active_sessions:
+        await websocket.accept()
+        await websocket.close(code=1008)
+        return
     await websocket.accept()
     logger.info(f"WebSocket view connection established for camera {camera_id}")
     
@@ -548,7 +605,7 @@ async def websocket_detection(websocket: WebSocket, camera_id: str):
 
 
 @app.get("/api/detection/{camera_id}/latest")
-def get_latest_detection(camera_id: str):
+def get_latest_detection(camera_id: str, current_user: dict = Depends(get_current_user)):
     """Get latest detection payload for a camera."""
     data = latest_detections.get(camera_id)
     if not data:
@@ -569,7 +626,7 @@ def _resolve_backend_host(request: Request) -> str:
 
 
 @app.post("/api/analyze-video")
-async def analyze_video(request: Request, video: UploadFile = File(...)):
+async def analyze_video(request: Request, video: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
     try:
         content = await video.read()
         backend_host = _resolve_backend_host(request)
@@ -610,7 +667,7 @@ async def analyze_video(request: Request, video: UploadFile = File(...)):
 
 
 @app.get("/api/video-analysis/{job_id}/status")
-async def get_video_analysis_status(job_id: str):
+async def get_video_analysis_status(job_id: str, current_user: dict = Depends(get_current_user)):
     try:
         timeout = httpx.Timeout(10.0, connect=5.0)
         async with httpx.AsyncClient(timeout=timeout) as client:
@@ -643,7 +700,7 @@ async def get_video_analysis_status(job_id: str):
 
 
 @app.post("/api/video-analysis/{job_id}/cancel")
-async def cancel_video_analysis(job_id: str):
+async def cancel_video_analysis(job_id: str, current_user: dict = Depends(get_current_user)):
     payload = {"job_id": job_id}
     try:
         timeout = httpx.Timeout(10.0, connect=5.0)
@@ -678,6 +735,12 @@ async def websocket_video_analysis(websocket: WebSocket, job_id: str):
             logger.info(f"Video analysis producer disconnected for job {job_id}")
         except Exception as exc:
             logger.error(f"Video analysis producer error for job {job_id}: {exc}")
+        return
+
+    token = websocket.query_params.get("token")
+    if not token or token not in active_sessions:
+        await websocket.accept()
+        await websocket.close(code=1008)
         return
 
     await websocket.accept()

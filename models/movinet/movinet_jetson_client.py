@@ -61,7 +61,8 @@ INPUT_SIZE       = 172   # MoViNet-A0/A1=172, A2=224
 INFER_INTERVAL_MS = 80
 
 # ── Video analysis inference ──────────────────────────────
-VIDEO_INFER_EVERY_N_FRAMES  = 1   
+# Lấy 1 frame, bỏ 4 frame (infer mỗi 5 frame)
+VIDEO_INFER_EVERY_N_FRAMES  = 5   
 VIDEO_STREAM_EVERY_N_FRAMES = 5   
 
 # ── Cấp 1: Asymmetric EMA — tăng nhanh, giảm nhanh ──────────
@@ -838,6 +839,7 @@ async def _video_analysis_coroutine(job: VideoJob, cuda_ctx, ws_url: str):
 
             frame_time_s = frame_idx / fps_video
 
+            # ── Lấy 1 frame, bỏ 4 frame (infer mỗi 5 frame) ─────────────────
             if frame_idx % VIDEO_INFER_EVERY_N_FRAMES == 0:
                 prob_raw = await loop.run_in_executor(
                     None, model.infer, frame
@@ -907,7 +909,8 @@ async def _video_analysis_coroutine(job: VideoJob, cuda_ctx, ws_url: str):
                         })
                         seg_start = None
 
-                if frame_idx % VIDEO_STREAM_EVERY_N_FRAMES == 0:
+                # ── Stream thumbnail (mỗi lần infer = mỗi 5 frame) ──────────
+                if True:
                     thumb_b64 = render_and_encode_thumb(frame)
                     progress  = frame_idx / max(total_frames, 1)
                     job.processed = frame_idx

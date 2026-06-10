@@ -1,5 +1,6 @@
 import { useNavigate, useLocation } from 'react-router-dom';
 import { ShieldAlert, LogOut } from 'lucide-react';
+import { apiService } from '../services/apiService';
 
 function Header() {
   const navigate = useNavigate();
@@ -18,6 +19,16 @@ function Header() {
   const handleLogoClick = () => {
     navigate('/');
   };
+
+  const handleLogout = async () => {
+    try {
+      await apiService.logout();
+    } catch (err) {
+      console.error('Logout error:', err);
+    }
+    navigate('/login');
+  };
+
 
   const isCameraActive = location.pathname === '/camera';
   const isDetectionHistoryActive = location.pathname === '/detection-history';
@@ -62,6 +73,7 @@ function Header() {
           <button 
             className="logout-btn" 
             type="button"
+            onClick={handleLogout}
             style={{ display: 'flex', alignItems: 'center', gap: '6px' }}
           >
             <LogOut size={16} />
