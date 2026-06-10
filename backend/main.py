@@ -43,6 +43,12 @@ class LoginRequest(BaseModel):
     username: str
     password: str
 
+class CameraCreateUpdate(BaseModel):
+    CameraName: str
+    CameraIP: str = None
+    CameraPhoneNum: str = None
+    CameraStatus: bool = True
+
 def get_current_user(request: Request):
     auth_header = request.headers.get("Authorization")
     if not auth_header or not auth_header.startswith("Bearer "):
@@ -336,6 +342,62 @@ def get_camera_by_id(camera_id: str, db: Session = Depends(get_db), current_user
         "CameraPhoneNum": camera.CameraPhoneNum,
         "CameraStatus": camera.CameraStatus
     }
+
+@app.post("/api/cameras")
+def create_camera(data: CameraCreateUpdate, db: Session = Depends(get_db), current_user: dict = Depends(get_current_user)):
+    """Create a new camera (Admin only)"""
+    if current_user.get("Username") != "admin":
+        raise HTTPException(status_code=403, detail="Chỉ tài khoản admin mới có quyền thực hiện thao tác này")
+    
+    camera = Camera(
+        CameraID=str(uuid.uuid4()),
+        CameraName=data.CameraName,
+        CameraIP=data.CameraIP,
+        CameraPhoneNum=data.CameraPhoneNum,
+        CameraStatus=data.CameraStatus,
+        UserID=current_user.get("UserID")
+    )
+    db.add(camera)
+    db.commit()
+    db.refresh(camera)
+    return camera
+
+@app.put("/api/cameras/{camera_id}")
+def update_camera(camera_id: str, data: CameraCreateUpdate, db: Session = Depends(get_db), current_user: dict = Depends(get_current_user)):
+    """Update camera details (Admin only)"""
+    if current_user.get("Username") != "admin":
+        raise HTTPException(status_code=403, detail="Chỉ tài khoản admin mới có quyền thực hiện thao tác này")
+    
+    camera = db.query(Camera).filter(Camera.CameraID == camera_id).first()
+    if not camera:
+        raise HTTPException(status_code=404, detail="Không tìm thấy camera")
+    
+    camera.CameraName = data.CameraName
+    camera.CameraIP = data.CameraIP
+    camera.CameraPhoneNum = data.CameraPhoneNum
+    camera.CameraStatus = data.CameraStatus
+    
+    db.commit()
+    db.refresh(camera)
+    return camera
+
+@app.delete("/api/cameras/{camera_id}")
+def delete_camera(camera_id: str, db: Session = Depends(get_db), current_user: dict = Depends(get_current_user)):
+    """Delete a camera (Admin only)"""
+    if current_user.get("Username") != "admin":
+        raise HTTPException(status_code=403, detail="Chỉ tài khoản admin mới có quyền thực hiện thao tác này")
+    
+    camera = db.query(Camera).filter(Camera.CameraID == camera_id).first()
+    if not camera:
+        raise HTTPException(status_code=404, detail="Không tìm thấy camera")
+    
+    # Clean up child records to satisfy constraints
+    db.query(Call).filter(Call.CameraID == camera_id).delete()
+    db.query(ViolenceHistory).filter(ViolenceHistory.CameraID == camera_id).delete()
+    
+    db.delete(camera)
+    db.commit()
+    return {"success": True}
 
 # ============= VIOLENCE HISTORY ENDPOINTS =============
 @app.get("/api/violence-history")

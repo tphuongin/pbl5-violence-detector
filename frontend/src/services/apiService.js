@@ -80,6 +80,58 @@ export const apiService = {
     }
   },
 
+  createCamera: async (cameraData) => {
+    try {
+      const response = await authFetch(`${API_BASE_URL}/cameras`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(cameraData),
+      });
+      if (!response.ok) {
+        const errData = await response.json();
+        throw new Error(errData.detail || 'Không thể tạo camera mới');
+      }
+      return await response.json();
+    } catch (error) {
+      console.error('Error creating camera:', error);
+      throw error;
+    }
+  },
+
+  updateCamera: async (cameraId, cameraData) => {
+    try {
+      const response = await authFetch(`${API_BASE_URL}/cameras/${cameraId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(cameraData),
+      });
+      if (!response.ok) {
+        const errData = await response.json();
+        throw new Error(errData.detail || 'Không thể cập nhật camera');
+      }
+      return await response.json();
+    } catch (error) {
+      console.error('Error updating camera:', error);
+      throw error;
+    }
+  },
+
+  deleteCamera: async (cameraId) => {
+    try {
+      const response = await authFetch(`${API_BASE_URL}/cameras/${cameraId}`, {
+        method: 'DELETE',
+      });
+      if (!response.ok) {
+        const errData = await response.json();
+        throw new Error(errData.detail || 'Không thể xóa camera');
+      }
+      return await response.json();
+    } catch (error) {
+      console.error('Error deleting camera:', error);
+      throw error;
+    }
+  },
+
   getLatestDetection: async (cameraId) => {
     try {
       const response = await authFetch(`${API_BASE_URL}/detection/${cameraId}/latest`);
