@@ -1,9 +1,58 @@
+"""
+mobilenet_jetson_client_v3.py
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Hai chế độ hoạt động (KHÔNG chạy đồng thời):
+
+  [CAMERA MODE]  — chế độ mặc định
+      CameraCapture (thread) → frame_event
+          ├── stream_video    (async) → ws://.../ws/stream/{CAMERA_ID}
+          └── run_inference   (thread) → DetectionResult + SharedState
+                  └── stream_detection (async) → ws://.../ws/detection/{CAMERA_ID}
+                          ├── BuzzerController (thread) → GPIO PIN 12
+                          └── PhoneDialer      (thread) → SIM AT command
+
+  [VIDEO ANALYSIS MODE]  — khi backend upload video
+      Backend POST /analyze-video  →  Jetson HTTP Server (aiohttp)
+          └── VideoAnalysisJob (thread)
+                  ├── cv2.VideoCapture(file)  đọc từng frame
+                  ├── MobileNetTRT.infer()    inference
+                  └── WebSocket stream        → ws://.../ws/video-analysis/{job_id}
+                          frame payload (real-time)  +  summary payload (cuối)
+
+  Jetson HTTP Server (aiohttp) lắng nghe trên JETSON_HTTP_PORT (mặc định 8001):
+      POST /analyze-video       — nhận file video, trả {"job_id": "..."}
+      GET  /status              — trả trạng thái hiện tại + job đang chạy
+      POST /cancel              — huỷ job đang chạy
+
+JSON detection payload (camera mode, gửi mỗi lần infer):
+{
+  "camera_id":         "jetson-cam-01",
+  "timestamp":         "14:35:22.047",
+  "label":             "VIOLENCE" | "Normal",
+  "prob_raw":          0.73,
+  "conf_thresh":       0.55,
+  "alert":             true,
+  "alert_until":       1.3,
+  "alert_sec":         3.0,
+  "infer_fps":         8.5,
+  "cam_fps":           29.8,
+  "uptime":            142,
+  "infer_ms":          118.4,
+  "num_frames":        16,
+  "violence_duration": 3.7,
+  "buzzer_active":     false,
+  "phone_calling":     false,
+  "thumb_b64":         "<base64 jpeg>"
+}
+
+Chạy: python3 mobilenet_jetson_client_v3.py
+"""
+
 import cv2
 import numpy as np
 import tensorrt as trt
 import pycuda.driver as cuda
-from collections import deque
-from typing import Optional
+import serial
 import threading
 import asyncio
 import websockets
@@ -11,9 +60,10 @@ import time
 import base64
 import json
 import logging
-import serial
 import uuid
 import os
+from collections import deque
+from typing import Optional
 
 import aiohttp
 from aiohttp import web
@@ -23,27 +73,28 @@ try:
     GPIO_AVAILABLE = True
 except ImportError:
     GPIO_AVAILABLE = False
-    logging.warning("[Buzzer] Jetson.GPIO không khả dụng — còi sẽ bị tắt.")
+    logging.warning("[Buzzer] Jetson.GPIO không khả dụng — còi và nút bấm sẽ bị tắt.")
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  CONFIG
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-BACKEND_HOST     = "192.168.137.1"
-BACKEND_PORT     = 8000
-CAMERA_ID        = "jetson-cam-01"
+# ── Backend ──────────────────────────────────────────────
+BACKEND_HOST      = "192.168.137.1"
+BACKEND_PORT      = 8000
+CAMERA_ID         = "jetson-cam-01"
 
-WS_STREAM_URL    = f"ws://{BACKEND_HOST}:{BACKEND_PORT}/ws/stream/{CAMERA_ID}"
-WS_DETECTION_URL = f"ws://{BACKEND_HOST}:{BACKEND_PORT}/ws/detection/{CAMERA_ID}"
-RECONNECT_DELAY  = 3
+WS_STREAM_URL     = f"ws://{BACKEND_HOST}:{BACKEND_PORT}/ws/stream/{CAMERA_ID}"
+WS_DETECTION_URL  = f"ws://{BACKEND_HOST}:{BACKEND_PORT}/ws/detection/{CAMERA_ID}"
 
-import threading
+RECONNECT_DELAY   = 3       # giây chờ trước khi reconnect WebSocket
+
 web_reset_event = threading.Event()
 
 # ── Jetson HTTP server (nhận video từ backend) ────────────
-JETSON_HTTP_HOST = "0.0.0.0"
-JETSON_HTTP_PORT = 8001
-UPLOAD_TMP_DIR   = "/tmp/jetson_video_upload"
+JETSON_HTTP_HOST  = "0.0.0.0"
+JETSON_HTTP_PORT  = 8001
+UPLOAD_TMP_DIR    = "/tmp/jetson_video_upload"
 MAX_VIDEO_SIZE_MB = 500
 
 # ── Video analysis WebSocket (Jetson → Backend) ───────────
@@ -51,57 +102,52 @@ WS_VIDEO_ANALYSIS_URL_TEMPLATE = (
     f"ws://{{backend_host}}:{BACKEND_PORT}/ws/video-analysis/{{job_id}}?role=producer"
 )
 
-CAMERA_WIDTH     = 640
-CAMERA_HEIGHT    = 480
-CAMERA_FPS       = 30
+# ── Camera ───────────────────────────────────────────────
+CAMERA_WIDTH      = 640
+CAMERA_HEIGHT     = 480
+CAMERA_FPS        = 30
 
-STREAM_FPS       = 15
-JPEG_QUALITY     = 70
+# ── Stream video ─────────────────────────────────────────
+STREAM_FPS        = 15      # FPS gửi lên backend
+JPEG_QUALITY      = 70
 
-ENGINE_PATH      = "movinet_v2.engine"
-INPUT_SIZE       = 172   # MoViNet-A0/A1=172, A2=224
+# ── TensorRT model ───────────────────────────────────────
+ENGINE_PATH       = "mobilenetv3_update.engine"
+NUM_FRAMES        = 16
+INPUT_SIZE        = 172
 
-INFER_INTERVAL_MS = 80
+# ── Detection logic ───────────────────────────────────────
+CONF_THRESH       = 0.55    # ngưỡng xác suất để kích hoạt alert
+ALERT_SECONDS     = 3.0     # thời gian duy trì trạng thái alert sau khi detect
+INFER_INTERVAL_MS = 80      # khoảng thời gian tối thiểu giữa 2 lần inference (ms)
 
 # ── Video analysis inference ──────────────────────────────
-# Lấy 1 frame, bỏ 4 frame (infer mỗi 5 frame)
-VIDEO_INFER_EVERY_N_FRAMES  = 5   
-VIDEO_STREAM_EVERY_N_FRAMES = 5   
+VIDEO_INFER_EVERY_N_FRAMES  = 1   # inference mỗi N frame (1 = mọi frame)
+VIDEO_STREAM_EVERY_N_FRAMES = 5   # gửi thumbnail mỗi N frame (giảm băng thông)
 
-# ── Cấp 1: Asymmetric EMA — tăng nhanh, giảm nhanh ──────────
-EMA_ALPHA_UP     = 0.30   
-EMA_ALPHA_DOWN   = 0.65   
-EMA_ALPHA        = 0.35   
+# ── Thumbnail gửi kèm payload ────────────────────────────
+THUMB_WIDTH       = 320
+THUMB_HEIGHT      = 180
 
-SPIKE_THRESH     = 0.20   
-SPIKE_BOOST      = 1.15   
+# ── Preprocessing (ImageNet normalization) ────────────────
+MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
-# ── Cấp 3: Hysteresis threshold — ngưỡng bật ≠ ngưỡng tắt ──
-THRESHOLD_ON     = 0.65   
-THRESHOLD_OFF    = 0.45   # [FIX]: Nâng lên 0.45 để model dễ thở và xuống Normal nhanh hơn
-THRESHOLD        = 0.50   
-CONFIRM_FRAMES   = 5      
-COOLDOWN_SEC     = 0.8
+# ── Buzzer (GPIO) ─────────────────────────────────────────
+BUZZER_PIN              = 12    # Chân vật lý BOARD
+BUTTON_PIN              = 16    # Chân nhận tín hiệu nút bấm (cạnh GND Pin 14)
+VIOLENCE_BUZZER_DELAY   = 5.0   # Giây bạo lực liên tục trước khi kêu còi + gọi điện
+BUZZER_BEEP_ON_SEC      = 0.5   # Thời gian còi kêu mỗi tiếng beep
+BUZZER_BEEP_OFF_SEC     = 0.3   # Khoảng nghỉ giữa các tiếng beep
 
-# ── Cấp 2: Force-reset state sau N frame Normal liên tiếp ───
-NORMAL_FRAMES_TO_RESET = 8   
-
-THUMB_WIDTH      = 320
-THUMB_HEIGHT     = 180
-
-BUZZER_PIN             = 12
-BUTTON_PIN             = 16    # Chân nhận tín hiệu nút bấm (cạnh GND Pin 14)
-VIOLENCE_BUZZER_DELAY  = 5.0
-BUZZER_BEEP_ON_SEC     = 0.5
-BUZZER_BEEP_OFF_SEC    = 0.3
-
-PHONE_NUMBER        = "0961521940"
-PHONE_SERIAL_PORT   = "/dev/ttyUSB2"
+# ── Phone (SIM module AT command) ────────────────────────
+PHONE_NUMBER        = "0961521940"     # Số điện thoại nhận cuộc gọi cảnh báo
+PHONE_SERIAL_PORT   = "/dev/ttyUSB2"   # Cổng serial của SIM module
 PHONE_BAUD_RATE     = 115200
-PHONE_CALL_TIMEOUT  = 30
-PHONE_RETRY_DELAY   = 60
-PHONE_RING_WAIT     = 5
-STARTUP_MUTE_SECONDS = 10.0
+PHONE_CALL_TIMEOUT  = 30               # Giây duy trì cuộc gọi rồi tự cúp
+PHONE_RETRY_DELAY   = 60               # Giây cooldown giữa 2 lần gọi
+PHONE_RING_WAIT     = 5                # Giây chờ sau ATD trước khi duy trì cuộc gọi
+STARTUP_MUTE_SECONDS = 10.0            # Bỏ qua alert trong N giây đầu sau khi khởi động
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -110,58 +156,13 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
     datefmt="%H:%M:%S",
 )
-logger = logging.getLogger("jetson")
+logger = logging.getLogger("jetson-mobilenet")
 
 TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
 
-IMAGE_NAME  = 'serving_default_image:0'
-LOGITS_NAME = 'StatefulPartitionedCall:0'
-
-STATE_MAP = {
-    'serving_default_state_block4_layer1_pool_frame_count:0': 'StatefulPartitionedCall:37',
-    'serving_default_state_block1_layer1_stream_buffer:0':    'StatefulPartitionedCall:8',
-    'serving_default_state_block1_layer2_stream_buffer:0':    'StatefulPartitionedCall:11',
-    'serving_default_state_block3_layer1_pool_frame_count:0': 'StatefulPartitionedCall:25',
-    'serving_default_state_block3_layer2_pool_buffer:0':      'StatefulPartitionedCall:27',
-    'serving_default_state_block3_layer3_pool_frame_count:0': 'StatefulPartitionedCall:31',
-    'serving_default_state_block4_layer0_pool_buffer:0':      'StatefulPartitionedCall:33',
-    'serving_default_state_head_pool_frame_count:0':          'StatefulPartitionedCall:43',
-    'serving_default_state_block3_layer0_stream_buffer:0':    'StatefulPartitionedCall:23',
-    'serving_default_state_block2_layer2_stream_buffer:0':    'StatefulPartitionedCall:20',
-    'serving_default_state_block2_layer1_pool_buffer:0':      'StatefulPartitionedCall:15',
-    'serving_default_state_block2_layer1_stream_buffer:0':    'StatefulPartitionedCall:17',
-    'serving_default_state_block3_layer1_stream_buffer:0':    'StatefulPartitionedCall:26',
-    'serving_default_state_block4_layer0_pool_frame_count:0': 'StatefulPartitionedCall:34',
-    'serving_default_state_block3_layer3_stream_buffer:0':    'StatefulPartitionedCall:32',
-    'serving_default_state_block1_layer1_pool_buffer:0':      'StatefulPartitionedCall:6',
-    'serving_default_state_block3_layer2_pool_frame_count:0': 'StatefulPartitionedCall:28',
-    'serving_default_state_block0_layer0_pool_buffer:0':      'StatefulPartitionedCall:1',
-    'serving_default_state_block0_layer0_pool_frame_count:0': 'StatefulPartitionedCall:2',
-    'serving_default_state_block1_layer0_pool_frame_count:0': 'StatefulPartitionedCall:4',
-    'serving_default_state_block3_layer0_pool_buffer:0':      'StatefulPartitionedCall:21',
-    'serving_default_state_block2_layer2_pool_frame_count:0': 'StatefulPartitionedCall:19',
-    'serving_default_state_block2_layer0_pool_frame_count:0': 'StatefulPartitionedCall:13',
-    'serving_default_state_block4_layer2_pool_frame_count:0': 'StatefulPartitionedCall:39',
-    'serving_default_state_block1_layer1_pool_frame_count:0': 'StatefulPartitionedCall:7',
-    'serving_default_state_block3_layer2_stream_buffer:0':    'StatefulPartitionedCall:29',
-    'serving_default_state_block4_layer0_stream_buffer:0':    'StatefulPartitionedCall:35',
-    'serving_default_state_block1_layer0_stream_buffer:0':    'StatefulPartitionedCall:5',
-    'serving_default_state_block3_layer1_pool_buffer:0':      'StatefulPartitionedCall:24',
-    'serving_default_state_block4_layer3_pool_buffer:0':      'StatefulPartitionedCall:40',
-    'serving_default_state_block1_layer0_pool_buffer:0':      'StatefulPartitionedCall:3',
-    'serving_default_state_block3_layer0_pool_frame_count:0': 'StatefulPartitionedCall:22',
-    'serving_default_state_block2_layer0_stream_buffer:0':    'StatefulPartitionedCall:14',
-    'serving_default_state_block2_layer2_pool_buffer:0':      'StatefulPartitionedCall:18',
-    'serving_default_state_head_pool_buffer:0':               'StatefulPartitionedCall:42',
-    'serving_default_state_block4_layer1_pool_buffer:0':      'StatefulPartitionedCall:36',
-    'serving_default_state_block1_layer2_pool_frame_count:0': 'StatefulPartitionedCall:10',
-    'serving_default_state_block1_layer2_pool_buffer:0':      'StatefulPartitionedCall:9',
-    'serving_default_state_block2_layer0_pool_buffer:0':      'StatefulPartitionedCall:12',
-    'serving_default_state_block4_layer3_pool_frame_count:0': 'StatefulPartitionedCall:41',
-    'serving_default_state_block4_layer2_pool_buffer:0':      'StatefulPartitionedCall:38',
-    'serving_default_state_block3_layer3_pool_buffer:0':      'StatefulPartitionedCall:30',
-    'serving_default_state_block2_layer1_pool_frame_count:0': 'StatefulPartitionedCall:16',
-}
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  JOB REGISTRY  — theo dõi các video analysis job
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class JobStatus:
     QUEUED     = "queued"
@@ -181,7 +182,7 @@ class VideoJob:
         self.created_at   = time.time()
         self.started_at   = None
         self.ended_at     = None
-        self.progress     = 0.0
+        self.progress     = 0.0        # 0.0 → 1.0
         self.total_frames = 0
         self.processed    = 0
         self.error_msg    = None
@@ -209,6 +210,7 @@ class VideoJob:
         }
 
 class JobRegistry:
+    """Thread-safe registry lưu tất cả video jobs."""
     def __init__(self):
         self._lock = threading.Lock()
         self._jobs: dict[str, VideoJob] = {}
@@ -231,6 +233,10 @@ class JobRegistry:
     def list_all(self) -> list:
         with self._lock:
             return [j.to_dict() for j in self._jobs.values()]
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  SHARED STATE  (camera mode)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class SharedState:
     def __init__(self):
@@ -268,6 +274,10 @@ def encode_frame_jpeg(frame: np.ndarray, quality: int = JPEG_QUALITY) -> bytes:
     _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
     return buf.tobytes()
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  BUZZER CONTROLLER
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 class BuzzerController(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True, name="BuzzerThread")
@@ -276,6 +286,7 @@ class BuzzerController(threading.Thread):
         self._lock     = threading.Lock()
         self._cond     = threading.Condition(self._lock)
         self.available = GPIO_AVAILABLE
+
         if self.available:
             GPIO.setmode(GPIO.BOARD)
             GPIO.setwarnings(False)
@@ -327,12 +338,14 @@ class BuzzerController(threading.Thread):
             self._set_gpio(False)
             if self.available:
                 GPIO.cleanup()
+                logger.info("[Buzzer] GPIO cleanup xong.")
 
     def _set_gpio(self, state: bool):
         if self.available:
             GPIO.output(BUZZER_PIN, GPIO.LOW if state else GPIO.HIGH)
-        elif state:
-            logger.debug("[Buzzer][SIM] BEEP ON")
+        else:
+            if state:
+                logger.debug("[Buzzer][SIM] BEEP ON")
 
     def _interruptible_sleep(self, seconds: float):
         deadline = time.time() + seconds
@@ -342,6 +355,10 @@ class BuzzerController(threading.Thread):
                 if remaining <= 0 or not self._running:
                     break
                 self._cond.wait(timeout=min(remaining, 0.05))
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  PHONE DIALER  (SIM module AT command)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class PhoneDialer(threading.Thread):
     _STATE_IDLE    = "IDLE"
@@ -561,6 +578,10 @@ class PhoneDialer(threading.Thread):
             self._state         = self._STATE_IDLE
         logger.info("[Phone] Line rảnh — sẵn sàng cho cuộc gọi tiếp theo.")
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  CAMERA CAPTURE THREAD
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 class CameraCapture(threading.Thread):
     def __init__(self, frame_event: threading.Event):
         super().__init__(daemon=True, name="CameraThread")
@@ -621,154 +642,117 @@ class CameraCapture(threading.Thread):
     def stop(self):
         self._running = False
 
-class MoViNetTRT:
-    def __init__(self, engine_path: str, cuda_ctx):
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  TENSORRT MODEL  (MobileNetV2-TSM 16-frame)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+class MobileNetTRT:
+    """
+    Wrapper TensorRT cho MobileNetV2-TSM.
+    Input : (1, 16, 3, INPUT_SIZE, INPUT_SIZE)  float32  ImageNet-normalized
+    Output: (1, 2)  logits  [normal, violence]
+    """
+    def __init__(self, engine_path, cuda_ctx):
         self.cuda_ctx = cuda_ctx
         self.cuda_ctx.push()
-        try:
-            self._load_engine(engine_path)
-        finally:
-            self.cuda_ctx.pop()
 
-    def _load_engine(self, engine_path: str):
-        self._runtime = trt.Runtime(TRT_LOGGER)
-        with open(engine_path, 'rb') as f:
-            self.engine = self._runtime.deserialize_cuda_engine(f.read())
-        if self.engine is None:
-            raise RuntimeError(f"[TRT] Không deserialize được engine: {engine_path}")
+        with open(engine_path, "rb") as f:
+            self.engine = trt.Runtime(TRT_LOGGER).deserialize_cuda_engine(f.read())
 
-        self.context = self.engine.create_execution_context()
+        self.context  = self.engine.create_execution_context()
+        self.inputs   = []
+        self.outputs  = []
+        self.bindings = []
+
+        for b in self.engine:
+            shape   = tuple(self.engine.get_binding_shape(b))
+            dtype   = trt.nptype(self.engine.get_binding_dtype(b))
+            dev_mem = cuda.mem_alloc(int(np.prod(shape)) * np.dtype(dtype).itemsize)
+            self.bindings.append(int(dev_mem))
+            info = {
+                "device": dev_mem,
+                "host":   cuda.pagelocked_empty(shape, dtype),
+            }
+            if self.engine.binding_is_input(b):
+                self.inputs.append(info)
+            else:
+                self.outputs.append(info)
+
         self.stream = cuda.Stream()
+        self.cuda_ctx.pop()
+        logger.info(f"[TRT] MobileNetV2-TSM loaded — {self.engine.num_bindings} bindings")
 
-        self.hbuf = {}
-        self.dbuf = {}
-        self._is_input  = {}
-        self._binding_info = []
-
-        for i in range(self.engine.num_bindings):
-            name     = self.engine.get_binding_name(i)
-            shape    = tuple(self.context.get_binding_shape(i))
-            dtype    = trt.nptype(self.engine.get_binding_dtype(i))
-            is_input = self.engine.binding_is_input(i)
-
-            if any(s < 0 for s in shape):
-                shape = tuple(max(1, s) for s in self.engine.get_binding_shape(i))
-                logger.warning(
-                    f"[TRT] Binding '{name}' có dynamic shape {shape}, "
-                    f"dùng fallback size=1 cho mỗi chiều âm"
-                )
-
-            size = max(1, int(np.prod(shape)))
-            h    = cuda.pagelocked_empty(size, dtype)
-            d    = cuda.mem_alloc(h.nbytes)
-
-            self.hbuf[name]      = h
-            self.dbuf[name]      = d
-            self._is_input[name] = is_input
-            self._binding_info.append((i, name, shape, dtype, is_input))
-
-        missing = [n for n in [IMAGE_NAME, LOGITS_NAME] if n not in self.hbuf]
-        if missing:
-            raise RuntimeError(f"[TRT] Không tìm thấy binding(s): {missing}")
-
-        logit_shape = next(
-            shape for _, name, shape, _, _ in self._binding_info
-            if name == LOGITS_NAME
-        )
-        if len(logit_shape) != 2 or logit_shape[0] != 1 or logit_shape[1] < 2:
-            raise RuntimeError(f"[TRT] LOGITS_NAME='{LOGITS_NAME}' sai shape")
-        self._num_classes = logit_shape[1]
-
-        self._valid_state_map = {
-            k: v for k, v in STATE_MAP.items()
-            if k in self.hbuf and v in self.hbuf
-        }
-
-        self.reset_states()
-
-    def reset_states(self):
-        for name in self._valid_state_map:
-            self.hbuf[name].fill(0)
-            cuda.memcpy_htod_async(self.dbuf[name], self.hbuf[name], self.stream)
-        self.stream.synchronize()
-
-    def infer(self, frame_bgr: np.ndarray) -> float:
+    def infer(self, blob: np.ndarray) -> np.ndarray:
         self.cuda_ctx.push()
         try:
-            return self._infer_inner(frame_bgr)
+            self.inputs[0]["host"].flat[:] = blob.ravel()
+            cuda.memcpy_htod_async(
+                self.inputs[0]["device"], self.inputs[0]["host"], self.stream)
+            self.context.execute_async_v2(self.bindings, self.stream.handle)
+            cuda.memcpy_dtoh_async(
+                self.outputs[0]["host"], self.outputs[0]["device"], self.stream)
+            self.stream.synchronize()
+            return self.outputs[0]["host"].copy().flatten()
         finally:
             self.cuda_ctx.pop()
 
-    def _infer_inner(self, frame_bgr: np.ndarray) -> float:
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        frame_resized = cv2.resize(
-            frame_rgb, (INPUT_SIZE, INPUT_SIZE),
-            interpolation=cv2.INTER_LINEAR
-        )
+    def destroy(self):
+        self.cuda_ctx.push()
+        del self.context
+        del self.engine
+        self.cuda_ctx.pop()
+        self.cuda_ctx.detach()
 
-        img = (frame_resized.astype(np.float32) / 255.0).reshape(
-            1, 1, INPUT_SIZE, INPUT_SIZE, 3
-        )
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  PREPROCESSING HELPENS
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-        img_flat = img.ravel()
-        np.copyto(self.hbuf[IMAGE_NAME], img_flat)
+def preprocess(frames: list) -> np.ndarray:
+    """
+    frames: list of NUM_FRAMES BGR numpy arrays
+    Returns: (1, NUM_FRAMES, 3, INPUT_SIZE, INPUT_SIZE) float32
+    """
+    out = []
+    for f in frames:
+        rgb = cv2.cvtColor(f, cv2.COLOR_BGR2RGB)
+        r   = cv2.resize(rgb, (INPUT_SIZE, INPUT_SIZE),
+                         interpolation=cv2.INTER_LINEAR)
+        n   = (r.astype(np.float32) / 255.0 - MEAN) / STD
+        out.append(n.transpose(2, 0, 1))   # (3, H, W)
+    return np.ascontiguousarray(np.stack(out)[np.newaxis], dtype=np.float32)
 
-        cuda.memcpy_htod_async(
-            self.dbuf[IMAGE_NAME], self.hbuf[IMAGE_NAME], self.stream
-        )
-        for in_name in self._valid_state_map:
-            cuda.memcpy_htod_async(
-                self.dbuf[in_name], self.hbuf[in_name], self.stream
-            )
+def softmax(x: np.ndarray) -> np.ndarray:
+    e = np.exp(x - x.max())
+    return e / e.sum()
 
-        bindings = [
-            int(self.dbuf[self.engine.get_binding_name(i)])
-            for i in range(self.engine.num_bindings)
-        ]
-        self.context.execute_async_v2(bindings=bindings, stream_handle=self.stream.handle)
-
-        cuda.memcpy_dtoh_async(
-            self.hbuf[LOGITS_NAME], self.dbuf[LOGITS_NAME], self.stream
-        )
-
-        tmp_states: dict[str, np.ndarray] = {}
-        for in_name, out_name in self._valid_state_map.items():
-            tmp = np.empty_like(self.hbuf[in_name])
-            cuda.memcpy_dtoh_async(tmp, self.dbuf[out_name], self.stream)
-            tmp_states[in_name] = tmp
-
-        self.stream.synchronize()
-
-        for in_name, tmp in tmp_states.items():
-            np.copyto(self.hbuf[in_name], tmp)
-
-        logits = self.hbuf[LOGITS_NAME].copy().astype(np.float32)
-        logits -= logits.max()
-        exp    = np.exp(logits)
-        probs  = exp / exp.sum()
-
-        if len(probs) < 2:
-            return 0.0
-
-        return float(probs[1])
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  SHARED STATE
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class DetectionResult:
-    def __init__(self, loop: asyncio.AbstractEventLoop):
+    def __init__(self, loop):
         self._lock  = threading.Lock()
         self._data  = None
         self._loop  = loop
-        self._event = asyncio.Event()
+        self._event = None
 
     def put(self, data: dict):
         with self._lock:
             self._data = data
-        self._loop.call_soon_threadsafe(self._event.set)
+        if self._event is not None:
+            self._loop.call_soon_threadsafe(self._event.set)
 
     async def get_new(self) -> dict:
+        if self._event is None:
+            self._event = asyncio.Event()
         await self._event.wait()
         self._event.clear()
         with self._lock:
             return self._data
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  VIDEO ANALYSIS JOB RUNNER
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def run_video_analysis(job: VideoJob,
                        cuda_ctx,
@@ -804,105 +788,72 @@ async def _video_analysis_coroutine(job: VideoJob, cuda_ctx, ws_url: str):
     if not cap.isOpened():
         raise RuntimeError(f"Không mở được video: {job.video_path}")
 
-    total_frames   = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps_video      = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    duration_s     = total_frames / fps_video
+    total_frames     = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps_video        = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    duration_s       = total_frames / fps_video
     job.total_frames = total_frames
+    
+    logger.info(
+        f"[VideoJob:{job.job_id[:8]}] "
+        f"{total_frames} frames  {fps_video:.1f}fps  {duration_s:.1f}s"
+    )
 
     loop = asyncio.get_event_loop()
     model = await loop.run_in_executor(
-        None, lambda: MoViNetTRT(ENGINE_PATH, cuda_ctx)
+        None, lambda: MobileNetTRT(ENGINE_PATH, cuda_ctx)
     )
 
-    prob_smooth        = 0.0
-    prev_prob_raw      = 0.0
-    confirm_count      = 0
-    violence_until     = 0.0
-    currently_violence = False
-    normal_streak      = 0
-    raw_low_streak     = 0    # [FIX] Đã thêm cho nhánh phân tích video
+    all_probs    = []
+    segments     = []
+    seg_start    = None
+    seg_max_prob = 0.0
+    alert_until  = 0.0
 
-    all_probs      = []
-    segments       = []
-    seg_start      = None
-    seg_max_prob   = 0.0
+    frame_buffer = deque(maxlen=NUM_FRAMES)
 
     t_start = time.time()
 
     async with websockets.connect(ws_url) as ws:
+        logger.info(f"[VideoJob:{job.job_id[:8]}] WS OK → {ws_url}")
+
         frame_idx = 0
         while True:
             if job.is_cancelled:
                 job.status = JobStatus.CANCELLED
+                logger.info(f"[VideoJob:{job.job_id[:8]}] Đã huỷ.")
                 break
 
             ret, frame = cap.read()
             if not ret:
-                break
+                break   # hết video
 
             frame_time_s = frame_idx / fps_video
+            frame_buffer.append(frame)
 
-            # ── Lấy 1 frame, bỏ 4 frame (infer mỗi 5 frame) ─────────────────
-            if frame_idx % VIDEO_INFER_EVERY_N_FRAMES == 0:
-                prob_raw = await loop.run_in_executor(
-                    None, model.infer, frame
+            # Chỉ inference khi đủ NUM_FRAMES và mỗi VIDEO_INFER_EVERY_N_FRAMES
+            if (len(frame_buffer) >= NUM_FRAMES and
+                    frame_idx % VIDEO_INFER_EVERY_N_FRAMES == 0):
+
+                blob = await loop.run_in_executor(
+                    None, lambda fb=frame_buffer: preprocess(list(fb))
                 )
+                logits = await loop.run_in_executor(None, model.infer, blob)
+                probs  = softmax(logits)
+                prob_raw = float(probs[1])
 
-                # ── Cấp 1: Asymmetric EMA ────────────────────────────────
-                alpha       = EMA_ALPHA_UP if prob_raw > prob_smooth else EMA_ALPHA_DOWN
-                prob_smooth = alpha * prob_raw + (1.0 - alpha) * prob_smooth
-                if (prob_raw - prev_prob_raw) > SPIKE_THRESH:
-                    prob_smooth = min(1.0, prob_smooth * SPIKE_BOOST)
-                prev_prob_raw = prob_raw
+                if prob_raw >= CONF_THRESH:
+                    alert_until = frame_time_s + ALERT_SECONDS
 
-                now_virtual = frame_time_s
-
-                # ── Lớp 2.5: Phá kẹt (Anti-Deadlock) ─────────────────────────
-                if prob_raw < 0.25:
-                    raw_low_streak += 1
-                    if raw_low_streak >= 5:
-                        await loop.run_in_executor(None, model.reset_states)
-                        prob_smooth = 0.0
-                        raw_low_streak = 0
-                else:
-                    raw_low_streak = 0
-
-                # ── Cấp 3: Hysteresis threshold ──────────────────────────────
-                if currently_violence:
-                    if prob_smooth >= THRESHOLD_OFF:
-                        confirm_count += 1
-                        violence_until = now_virtual + COOLDOWN_SEC # [FIX] Chống chớp tắt
-                    else:
-                        confirm_count = 0
-                else:
-                    if prob_smooth >= THRESHOLD_ON:
-                        confirm_count += 1
-                    else:
-                        confirm_count = 0
-                    if confirm_count >= CONFIRM_FRAMES:
-                        violence_until = now_virtual + COOLDOWN_SEC
-
-                label = 'VIOLENCE' if now_virtual < violence_until else 'Normal'
-                currently_violence = (label == 'VIOLENCE')
-
-                # ── Cấp 2: Force-reset sau N frame Normal liên tiếp ──────────
-                if label == 'Normal':
-                    normal_streak += 1
-                    if normal_streak >= NORMAL_FRAMES_TO_RESET:
-                        await loop.run_in_executor(None, model.reset_states)
-                        normal_streak = 0
-                        prob_smooth   = 0.0
-                        confirm_count = 0
-                else:
-                    normal_streak = 0
+                is_alert = frame_time_s < alert_until
+                label    = "VIOLENCE" if is_alert else "Normal"
                 all_probs.append(prob_raw)
 
-                if label == 'VIOLENCE':
+                if label == "VIOLENCE":
                     if seg_start is None:
                         seg_start    = frame_time_s
-                        seg_max_prob = prob_smooth
+                        seg_max_prob = prob_raw
                     else:
-                        seg_max_prob = max(seg_max_prob, prob_smooth)
+                        seg_max_prob = max(seg_max_prob, prob_raw)
                 else:
                     if seg_start is not None:
                         segments.append({
@@ -912,8 +863,7 @@ async def _video_analysis_coroutine(job: VideoJob, cuda_ctx, ws_url: str):
                         })
                         seg_start = None
 
-                # ── Stream thumbnail (mỗi lần infer = mỗi 5 frame) ──────────
-                if True:
+                if frame_idx % VIDEO_STREAM_EVERY_N_FRAMES == 0:
                     thumb_b64 = render_and_encode_thumb(frame)
                     progress  = frame_idx / max(total_frames, 1)
                     job.processed = frame_idx
@@ -930,8 +880,8 @@ async def _video_analysis_coroutine(job: VideoJob, cuda_ctx, ws_url: str):
                         "total_frames": total_frames,
                         "progress":     round(progress, 3),
                         "label":        label,
-                        "prob_raw":     round(prob_raw,    4),
-                        "prob_smooth":  round(prob_smooth, 4),
+                        "prob_raw":     round(prob_raw, 4),
+                        "prob_smooth":  round(prob_raw, 4),
                         "thumb_b64":    thumb_b64,
                         "timestamp":    ts_str,
                     }
@@ -953,10 +903,10 @@ async def _video_analysis_coroutine(job: VideoJob, cuda_ctx, ws_url: str):
             job.ended_at = time.time()
             job.progress = 1.0
 
-            n_inferred      = len(all_probs)
-            n_violence      = sum(1 for p in all_probs if p >= THRESHOLD)
-            violence_ratio  = n_violence / max(n_inferred, 1)
-            verdict         = 'VIOLENCE' if violence_ratio >= 0.15 else 'Normal'
+            n_inferred     = len(all_probs)
+            n_violence     = sum(1 for p in all_probs if p >= CONF_THRESH)
+            violence_ratio = n_violence / max(n_inferred, 1)
+            verdict        = 'VIOLENCE' if violence_ratio >= 0.15 else 'Normal'
             processing_time = job.ended_at - t_start
 
             summary_payload = {
@@ -975,298 +925,20 @@ async def _video_analysis_coroutine(job: VideoJob, cuda_ctx, ws_url: str):
                 "processing_time_s":  round(processing_time,  2),
             }
             await ws.send(json.dumps(summary_payload, ensure_ascii=False))
-
-def run_inference(cam: CameraCapture,
-                  frame_event: threading.Event,
-                  shared_state: SharedState,
-                  result_queue: DetectionResult,
-                  buzzer: BuzzerController,
-                  dialer: PhoneDialer,
-                  start_time: float,
-                  cuda_ctx):          
-    logger.info("[Inference] Loading TensorRT engine …")
-    model = MoViNetTRT(ENGINE_PATH, cuda_ctx)
-
-    if not frame_event.wait(timeout=30.0):
-        logger.error("[Inference] Timeout frame!")
-        return
-
-    logger.info("[Inference] Bắt đầu inference.")
-
-    prob_smooth         = 0.0
-    prev_prob_raw       = 0.0
-    confirm_count       = 0
-    violence_until      = 0.0
-    violence_start_time = None
-    last_violence_time  = 0.0   
-    alert_triggered     = False
-    last_infer_ms       = 0.0
-    currently_violence  = False   
-    normal_streak       = 0       
-    raw_low_streak      = 0       # [FIX] Lớp 2.5 theo dõi raw prob phá kẹt
-
-    # ── [THÊM MỚI] CÀI ĐẶT NÚT BẤM (HARDWARE INTERRUPT) ──────────────────
-    manual_reset_event = threading.Event()
-    force_mute_until   = 0.0
-
-    if GPIO_AVAILABLE:
-        # Cài đặt Pin 16 là Input, bật điện trở kéo lên 3.3V nội bộ
-        GPIO.setup(BUTTON_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-
-        # Hàm callback chạy ngầm khi nút được bấm (kéo tín hiệu xuống GND)
-        def button_callback(channel):
-            manual_reset_event.set()
-
-        # Kích hoạt ngắt khi có sườn âm (FALLING), bouncetime 1000ms chống dội phím
-        GPIO.add_event_detect(
-            BUTTON_PIN, GPIO.FALLING,
-            callback=button_callback,
-            bouncetime=1000
-        )
-        logger.info(f"[Button] Hardware interrupt đã kích hoạt — GPIO PIN {BUTTON_PIN}.")
-    else:
-        logger.warning("[Button] GPIO không khả dụng — nút bấm sẽ không hoạt động.")
-    # ────────────────────────────────────────────────────────────────────────
-
-    cam_times   = deque(maxlen=60)
-    infer_times = deque(maxlen=30)
-
-    try:
-        while True:
-            frame_event.clear()
-            frame = cam.get_latest()
-            if frame is None:
-                frame_event.wait(timeout=0.1)
-                continue
-
-            now    = time.time()
-            now_ms = now * 1000
-            startup_muted = (now - start_time) < STARTUP_MUTE_SECONDS
-
-            if (now_ms - last_infer_ms) < INFER_INTERVAL_MS:
-                frame_event.wait(timeout=0.1)
-                continue
-
-            # ── [THÊM MỚI] XỬ LÝ KHI NÚT ĐƯỢC BẤM HOẶC CÓ YÊU CẦU TỪ WEB ──
-            if manual_reset_event.is_set() or web_reset_event.is_set():
-                is_web = web_reset_event.is_set()
-                manual_reset_event.clear()
-                web_reset_event.clear()
-                trigger_source = "Web UI" if is_web else "Hardware Button"
-                logger.warning(f"[{trigger_source}] 🛑 ĐÃ NHẬN YÊU CẦU RESET! Tắt còi, hủy gọi điện, ép reset AI.")
-
-                # Đập tan trí nhớ của model
-                model.reset_states()
-                prob_smooth         = 0.0
-                prev_prob_raw       = 0.0
-                confirm_count       = 0
-                normal_streak       = 0
-                raw_low_streak      = 0
-                violence_start_time = None
-                violence_duration   = 0.0
-                currently_violence  = False
-                alert_triggered     = False
-                label               = 'Normal'
-
-                # Tắt các thiết bị ngoại vi ngay lập tức
-                buzzer.deactivate()
-                dialer.cancel_call()
-
-                # "Mù tạm thời" 5 giây — tránh còi rú lại ngay khi chưa thoát khỏi khung bạo lực
-                force_mute_until = now + 5.0
-                logger.info(f"[{trigger_source}] Hệ thống tạm dừng phân tích trong 5 giây.")
-
-            # Nếu đang trong thời gian "mù" do vừa bấm nút, bỏ qua frame này
-            if now < force_mute_until:
-                frame_event.wait(timeout=0.1)
-                continue
-            # ────────────────────────────────────────────────────────────────
-
-            t0       = time.time()
-            prob_raw = model.infer(frame)
-            t1       = time.time()
-            last_infer_ms = now_ms
-            infer_times.append(t1)
-
-            # ── Cấp 1: Asymmetric EMA ────────────────────────────
-            alpha       = EMA_ALPHA_UP if prob_raw > prob_smooth else EMA_ALPHA_DOWN
-            prob_smooth = alpha * prob_raw + (1.0 - alpha) * prob_smooth
-            if (prob_raw - prev_prob_raw) > SPIKE_THRESH:
-                prob_smooth = min(1.0, prob_smooth * SPIKE_BOOST)
-            prev_prob_raw = prob_raw
-
-            # ── [THÊM MỚI] Lớp 2.5: Phá kẹt (Anti-Deadlock) ──────────
-            # Xóa sạch dư âm trong model ngay khi camera thấy cảnh vật im lìm
-            if prob_raw < 0.25:
-                raw_low_streak += 1
-                if raw_low_streak >= 5:
-                    model.reset_states()  
-                    prob_smooth = 0.0     
-                    raw_low_streak = 0
-                    logger.debug("[Inference] Lớp 2.5: Phá kẹt dư âm, ép reset.")
-            else:
-                raw_low_streak = 0
-            # ─────────────────────────────────────────────────────────
-
-            # ── Cấp 3: Hysteresis — confirm để BẬT, threshold thấp hơn để TẮT ──
-            if currently_violence:
-                if prob_smooth >= THRESHOLD_OFF:
-                    confirm_count += 1
-                    # [FIX] Liên tục gia hạn thời gian bạo lực để không bị chớp tắt
-                    violence_until = now + COOLDOWN_SEC  
-                else:
-                    confirm_count = 0
-            else:
-                if prob_smooth >= THRESHOLD_ON:
-                    confirm_count += 1
-                else:
-                    confirm_count = 0
-                if confirm_count >= CONFIRM_FRAMES:
-                    violence_until = now + COOLDOWN_SEC
-
-            label = 'VIOLENCE' if now < violence_until else 'Normal'
-            currently_violence = (label == 'VIOLENCE')
-
-            # ── Cấp 2: Force-reset sau N frame Normal liên tiếp ──────────────
-            if label == 'Normal':
-                normal_streak += 1
-                if normal_streak >= NORMAL_FRAMES_TO_RESET:
-                    model.reset_states()          
-                    normal_streak = 0
-                    prob_smooth   = 0.0           
-                    confirm_count = 0
-            else:
-                normal_streak = 0
-            shared_state.update(frame, prob_raw, prob_smooth, label)
-
-            # ── LOGIC KIỂM TRA BẠO LỰC CÓ DUNG SAI (GRACE PERIOD) ──
-            if label == 'VIOLENCE':
-                if violence_start_time is None:
-                    violence_start_time = now
-                    alert_triggered     = False
-                
-                last_violence_time = now  
-                
-                violence_duration = now - violence_start_time
-                if violence_duration >= VIOLENCE_BUZZER_DELAY:
-                    if not startup_muted:
-                        buzzer.activate()
-                        if not alert_triggered:
-                            dialer.request_call()
-                            alert_triggered = True
-                    else:
-                        buzzer.deactivate()
-                        dialer.cancel_call()
-            else:
-                # Không reset ngay, kiểm tra xem đã qua thời gian dung sai 3.0s chưa
-                if violence_start_time is not None:
-                    if (now - last_violence_time) > 3.0: 
-                        violence_start_time = None
-                        alert_triggered     = False
-                        violence_duration = 0.0
-                    else:
-                        violence_duration = now - violence_start_time
-                else:
-                    violence_duration = 0.0
-                
-                buzzer.deactivate()
-                dialer.cancel_call()
-
-            cam_times.append(now)
-            infer_fps = (
-                (len(infer_times) - 1) / (infer_times[-1] - infer_times[0])
-                if len(infer_times) > 1 else 0.0
-            )
-            cam_fps = (
-                (len(cam_times) - 1) / (cam_times[-1] - cam_times[0])
-                if len(cam_times) > 1 else 0.0
-            )
-
-            ts_str = time.strftime('%H:%M:%S') + f'.{int((now % 1) * 1000):03d}'
-
-            payload = {
-                "camera_id":         CAMERA_ID,
-                "timestamp":         ts_str,
-                "label":             label,
-                "prob_raw":          round(prob_raw,         4),
-                "prob_smooth":       round(prob_smooth,       4),
-                "confirm_count":     confirm_count,
-                "confirm_needed":    CONFIRM_FRAMES,
-                "threshold":         THRESHOLD,
-                "infer_fps":         round(infer_fps,        1),
-                "cam_fps":           round(cam_fps,          1),
-                "uptime":            int(now - start_time),
-                "infer_ms":          round((t1 - t0) * 1000, 1),
-                "violence_duration": round(violence_duration, 2),
-                "buzzer_active":     buzzer.is_active,
-                "phone_calling":     dialer.is_calling,
-            }
-            result_queue.put(payload)
-
             logger.info(
-                f"raw={prob_raw:.3f}  smooth={prob_smooth:.3f}  "
-                f"confirm={confirm_count}/{CONFIRM_FRAMES}  → {label}  "
-                f"dur={violence_duration:.1f}s  "
-                f"buzzer={'ON' if buzzer.is_active else 'off'}  "
-                f"phone={'CALLING' if dialer.is_calling else 'idle'}  "
-                f"({(t1 - t0) * 1000:.0f}ms)"
+                f"[VideoJob:{job.job_id[:8]}] DONE — "
+                f"verdict={verdict}  ratio={violence_ratio:.2%}  "
+                f"segments={len(segments)}  "
+                f"time={processing_time:.1f}s"
             )
-            frame_event.wait(timeout=0.1)
 
-    except Exception as e:
-        logger.exception(f"[Inference] Lỗi: {e}")
-    finally:
-        buzzer.deactivate()
-        dialer.cancel_call()
-
-async def stream_video(cam: CameraCapture,
-                       loop: asyncio.AbstractEventLoop):
-    interval = 1.0 / STREAM_FPS
-    while True:
-        try:
-            async with websockets.connect(WS_STREAM_URL) as ws:
-                logger.info(f"[Stream] Kết nối OK → {WS_STREAM_URL}")
-                while True:
-                    t0    = time.time()
-                    frame = cam.get_latest()
-                    if frame is not None:
-                        jpeg_bytes = await loop.run_in_executor(
-                            None, encode_frame_jpeg, frame)
-                        await ws.send(jpeg_bytes)
-                    await asyncio.sleep(max(0.0, interval - (time.time() - t0)))
-        except websockets.exceptions.ConnectionClosed:
-            logger.warning(f"[Stream] Mất kết nối, thử lại …")
-        except Exception as e:
-            logger.error(f"[Stream] Lỗi: {e}")
-        await asyncio.sleep(RECONNECT_DELAY)
-
-async def stream_detection(result_queue: DetectionResult,
-                            shared_state: SharedState,
-                            loop: asyncio.AbstractEventLoop):
-    while True:
-        try:
-            async with websockets.connect(WS_DETECTION_URL) as ws:
-                logger.info(f"[Detection] Kết nối OK → {WS_DETECTION_URL}")
-                while True:
-                    payload = await result_queue.get_new()
-                    snap = shared_state.snapshot()
-                    if snap is not None:
-                        thumb_b64 = await loop.run_in_executor(
-                            None, render_and_encode_thumb, snap['raw_frame'])
-                        payload['thumb_b64'] = thumb_b64
-                    else:
-                        payload['thumb_b64'] = ''
-                    await ws.send(json.dumps(payload, ensure_ascii=False))
-        except websockets.exceptions.ConnectionClosed:
-            logger.warning(f"[Detection] Mất kết nối, thử lại …")
-        except Exception as e:
-            logger.error(f"[Detection] Lỗi: {e}")
-        await asyncio.sleep(RECONNECT_DELAY)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  AIOHTTP HTTP SERVER  — nhận video từ backend
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def build_http_app(job_registry: JobRegistry,
                    loop: asyncio.AbstractEventLoop,
                    cuda_ctx) -> web.Application:
-
     os.makedirs(UPLOAD_TMP_DIR, exist_ok=True)
 
     async def handle_analyze_video(request: web.Request) -> web.Response:
@@ -1336,9 +1008,9 @@ def build_http_app(job_registry: JobRegistry,
     async def handle_status(request: web.Request) -> web.Response:
         running = job_registry.current_running()
         return web.json_response({
-            "mode":         "video_analysis" if running else "idle",
-            "current_job":  running.to_dict() if running else None,
-            "jobs":         job_registry.list_all(),
+            "mode":        "video_analysis" if running else "idle",
+            "current_job": running.to_dict() if running else None,
+            "jobs":        job_registry.list_all(),
         })
 
     async def handle_cancel(request: web.Request) -> web.Response:
@@ -1371,13 +1043,295 @@ def build_http_app(job_registry: JobRegistry,
     app.router.add_post("/mute",          handle_mute)
     return app
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  INFERENCE THREAD
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def run_inference(cam: CameraCapture,
+                  frame_event: threading.Event,
+                  result_queue: DetectionResult,
+                  shared_state: SharedState,
+                  buzzer: BuzzerController,
+                  dialer: PhoneDialer,
+                  start_time: float,
+                  cuda_ctx):
+    """
+    Thu thập NUM_FRAMES frame từ camera, chạy TRT inference,
+    áp dụng logic alert, rồi đẩy payload vào result_queue.
+    Dùng cuda_ctx chia sẻ từ main (không tạo ctx mới).
+    """
+    cuda_ctx.push()
+
+    logger.info("[Inference] Loading TensorRT engine …")
+    model = MobileNetTRT(ENGINE_PATH, cuda_ctx)
+
+    if not frame_event.wait(timeout=30.0):
+        logger.error("[Inference] Timeout frame!")
+        return
+
+    logger.info("[Inference] Bắt đầu inference.")
+
+    # ── Frame buffer (sliding window NUM_FRAMES frames) ──
+    frame_buffer = deque(maxlen=NUM_FRAMES)
+
+    # ── Alert state ───────────────────────────────────────
+    alert_until = 0.0
+    is_alert    = False
+
+    # ── Biến theo dõi thời gian bạo lực liên tục ─────────
+    violence_start_time = None   # None = không có bạo lực hiện tại
+    alert_triggered     = False  # đã trigger còi + gọi điện trong đợt này chưa
+    last_infer_ms       = 0.0
+
+    # ── [THÊM MỚI] CÀI ĐẶT NÚT BẤM (HARDWARE INTERRUPT) ──────────────────
+    manual_reset_event = threading.Event()
+    force_mute_until   = 0.0
+
+    if GPIO_AVAILABLE:
+        GPIO.setup(BUTTON_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
+        def button_callback(channel):
+            manual_reset_event.set()
+
+        GPIO.add_event_detect(
+            BUTTON_PIN, GPIO.FALLING,
+            callback=button_callback,
+            bouncetime=1000
+        )
+        logger.info(f"[Button] Hardware interrupt đã kích hoạt — GPIO PIN {BUTTON_PIN}.")
+    else:
+        logger.warning("[Button] GPIO không khả dụng — nút bấm sẽ không hoạt động.")
+    # ────────────────────────────────────────────────────────────────────────
+
+    # ── FPS tracking ─────────────────────────────────────
+    cam_times   = deque(maxlen=60)
+    infer_times = deque(maxlen=30)
+
+    try:
+        while True:
+            frame_event.clear()
+            frame = cam.get_latest()
+            if frame is None:
+                frame_event.wait(timeout=0.1)
+                continue
+
+            now    = time.time()
+            now_ms = now * 1000
+            startup_muted = (now - start_time) < STARTUP_MUTE_SECONDS
+
+            if (now_ms - last_infer_ms) < INFER_INTERVAL_MS:
+                frame_event.wait(timeout=0.1)
+                continue
+
+            # ── [THÊM MỚI] XỬ LÝ KHI NÚT ĐƯỢC BẤM HOẶC CÓ YÊU CẦU TỪ WEB ──
+            if manual_reset_event.is_set() or web_reset_event.is_set():
+                is_web = web_reset_event.is_set()
+                manual_reset_event.clear()
+                web_reset_event.clear()
+                trigger_source = "Web UI" if is_web else "Hardware Button"
+                logger.warning(f"[{trigger_source}] 🛑 ĐÃ NHẬN YÊU CẦU RESET! Tắt còi, hủy gọi điện, ép reset AI.")
+
+                frame_buffer.clear()
+                violence_start_time = None
+                alert_triggered     = False
+                alert_until         = 0.0
+                is_alert            = False
+                label               = 'Normal'
+                violence_duration   = 0.0
+
+                buzzer.deactivate()
+                dialer.cancel_call()
+
+                force_mute_until = now + 5.0
+                logger.info(f"[{trigger_source}] Hệ thống tạm dừng phân tích trong 5 giây.")
+
+            if now < force_mute_until:
+                frame_event.wait(timeout=0.1)
+                continue
+            # ────────────────────────────────────────────────────────────────
+
+            frame_buffer.append(frame)
+            cam_times.append(now)
+
+            # Chờ đủ NUM_FRAMES mới bắt đầu infer
+            if len(frame_buffer) < NUM_FRAMES:
+                logger.info(f"[Inference] Buffering {len(frame_buffer)}/{NUM_FRAMES}…")
+                last_infer_ms = now_ms
+                frame_event.wait(timeout=0.1)
+                continue
+
+            # ── Inference ────────────────────────────────
+            t0 = time.time()
+            try:
+                blob     = preprocess(list(frame_buffer))
+                logits   = model.infer(blob)
+                probs    = softmax(logits)
+                prob_raw = float(probs[1])   # index 1 = violence
+            except Exception as e:
+                logger.error(f"[Inference] Lỗi infer: {e}")
+                last_infer_ms = now_ms
+                frame_event.wait(timeout=0.1)
+                continue
+            t1 = time.time()
+            last_infer_ms = now_ms
+            infer_times.append(t1)
+
+            # ── Alert logic ───────────────────────────────
+            if prob_raw >= CONF_THRESH:
+                alert_until = now + ALERT_SECONDS
+
+            is_alert = now < alert_until
+            label = "VIOLENCE" if is_alert else "Normal"
+            shared_state.update(frame, prob_raw, prob_raw, label)
+
+            # ── Buzzer + Phone logic ──────────────────────
+            if label == "VIOLENCE":
+                if violence_start_time is None:
+                    violence_start_time = now
+                    alert_triggered     = False
+                    logger.info("[Alert] Bắt đầu theo dõi thời gian bạo lực …")
+
+                violence_duration = now - violence_start_time
+
+                if violence_duration >= VIOLENCE_BUZZER_DELAY:
+                    if not startup_muted:
+                        buzzer.activate()
+                        if not alert_triggered:
+                            dialer.request_call()
+                            alert_triggered = True
+                    else:
+                        buzzer.deactivate()
+                        dialer.cancel_call()
+                else:
+                    remaining = VIOLENCE_BUZZER_DELAY - violence_duration
+                    logger.debug(
+                        f"[Alert] Bạo lực {violence_duration:.1f}s "
+                        f"/ {VIOLENCE_BUZZER_DELAY}s "
+                        f"(còn {remaining:.1f}s nữa)")
+            else:
+                if violence_start_time is not None:
+                    elapsed = now - violence_start_time
+                    logger.info(f"[Alert] Kết thúc bạo lực sau {elapsed:.1f}s — reset.")
+                    violence_start_time = None
+                    alert_triggered     = False
+                buzzer.deactivate()
+                dialer.cancel_call()
+                violence_duration = 0.0
+
+            # ── FPS ──────────────────────────────────────
+            infer_fps = (len(infer_times) - 1) / (infer_times[-1] - infer_times[0]) \
+                        if len(infer_times) > 1 else 0.0
+            cam_fps   = (len(cam_times) - 1) / (cam_times[-1] - cam_times[0]) \
+                        if len(cam_times) > 1 else 0.0
+
+            # ── Thumbnail ────────────────────────────────
+            ts_str = (time.strftime("%H:%M:%S") + f".{int((now % 1) * 1000):03d}")
+
+            # ── Payload ───────────────────────────────────
+            payload = {
+                "camera_id":         CAMERA_ID,
+                "timestamp":         ts_str,
+                "label":             label,
+                "prob_raw":          round(prob_raw,            4),
+                "prob_smooth":       round(prob_raw,            4),
+                "conf_thresh":       CONF_THRESH,
+                "alert":             is_alert,
+                "alert_until":       round(max(0.0, alert_until - now), 2),
+                "alert_sec":         ALERT_SECONDS,
+                "infer_fps":         round(infer_fps,           1),
+                "cam_fps":           round(cam_fps,             1),
+                "uptime":            int(now - start_time),
+                "infer_ms":          round((t1 - t0) * 1000,    1),
+                "num_frames":        NUM_FRAMES,
+                "violence_duration": round(violence_duration,   2),
+                "buzzer_active":     buzzer.is_active,
+                "phone_calling":     dialer.is_calling,
+            }
+
+            result_queue.put(payload)
+
+            logger.info(
+                f"prob={prob_raw:.3f}  alert={is_alert}  → {label}  "
+                f"dur={violence_duration:.1f}s  "
+                f"buzzer={'ON' if buzzer.is_active else 'off'}  "
+                f"phone={'CALLING' if dialer.is_calling else 'idle'}  "
+                f"({(t1 - t0) * 1000:.0f}ms)"
+            )
+            frame_event.wait(timeout=0.1)
+
+    except Exception as e:
+        logger.exception(f"[Inference] Lỗi nghiêm trọng: {e}")
+    finally:
+        buzzer.deactivate()
+        dialer.cancel_call()
+        model.destroy()
+        cuda_ctx.pop()
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  ASYNC TASK 1 — STREAM VIDEO
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+async def stream_video(cam: CameraCapture,
+                       loop: asyncio.AbstractEventLoop):
+    interval = 1.0 / STREAM_FPS
+    while True:
+        try:
+            async with websockets.connect(WS_STREAM_URL) as ws:
+                logger.info(f"[Stream] Kết nối OK → {WS_STREAM_URL}")
+                while True:
+                    t0    = time.time()
+                    frame = cam.get_latest()
+                    if frame is not None:
+                        jpeg_bytes = await loop.run_in_executor(
+                            None, encode_frame_jpeg, frame)
+                        await ws.send(jpeg_bytes)
+                    sleep_t = interval - (time.time() - t0)
+                    if sleep_t > 0:
+                        await asyncio.sleep(sleep_t)
+                    else:
+                        await asyncio.sleep(0)
+        except websockets.exceptions.ConnectionClosed:
+            logger.warning(f"[Stream] Mất kết nối, thử lại sau {RECONNECT_DELAY}s …")
+        except Exception as e:
+            logger.error(f"[Stream] Lỗi: {e}, thử lại sau {RECONNECT_DELAY}s …")
+        await asyncio.sleep(RECONNECT_DELAY)
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  ASYNC TASK 2 — GỬI KẾT QUẢ DETECTION
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+async def stream_detection(result_queue: DetectionResult,
+                            shared_state: SharedState,
+                            loop: asyncio.AbstractEventLoop):
+    while True:
+        try:
+            async with websockets.connect(WS_DETECTION_URL) as ws:
+                logger.info(f"[Detection] Kết nối OK → {WS_DETECTION_URL}")
+                while True:
+                    payload = await result_queue.get_new()
+                    snap = shared_state.snapshot()
+                    if snap is not None:
+                        thumb_b64 = await loop.run_in_executor(
+                            None, render_and_encode_thumb, snap['raw_frame'])
+                        payload['thumb_b64'] = thumb_b64
+                    await ws.send(json.dumps(payload, ensure_ascii=False))
+        except websockets.exceptions.ConnectionClosed:
+            logger.warning(f"[Detection] Mất kết nối, thử lại sau {RECONNECT_DELAY}s …")
+        except Exception as e:
+            logger.error(f"[Detection] Lỗi: {e}, thử lại sau {RECONNECT_DELAY}s …")
+        await asyncio.sleep(RECONNECT_DELAY)
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  MAIN
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 async def main():
     start_time = time.time()
     loop       = asyncio.get_event_loop()
 
     cuda.init()
     cuda_ctx = cuda.Device(0).make_context()
-    cuda_ctx.pop()   
+    cuda_ctx.pop()   # pop ngay, mỗi thread sẽ push/pop khi cần
 
     buzzer = BuzzerController()
     buzzer.start()
@@ -1392,13 +1346,13 @@ async def main():
     cam = CameraCapture(frame_event)
     cam.start()
     logger.info("[Main] Chờ camera kết nối …")
-    for _ in range(300):
+    for _ in range(80):
         if cam.connected or cam.error_msg:
             break
         await asyncio.sleep(0.1)
 
-    if not cam.connected:
-        logger.error(f"[Main] Không thể kết nối camera: {cam.error_msg}")
+    if cam.error_msg:
+        logger.error(f"[Main] {cam.error_msg}")
         buzzer.stop()
         dialer.stop()
         cuda_ctx.detach()
@@ -1410,12 +1364,13 @@ async def main():
 
     infer_thread = threading.Thread(
         target=run_inference,
-        args=(cam, frame_event, shared_state, result_queue,
-              buzzer, dialer, start_time, cuda_ctx),   
+        args=(cam, frame_event, result_queue, shared_state, buzzer, dialer,
+              start_time, cuda_ctx),
         daemon=True,
         name="InferenceThread",
     )
     infer_thread.start()
+    logger.info("[Main] Inference thread đã khởi động")
 
     http_app    = build_http_app(job_registry, loop, cuda_ctx)
     http_runner = web.AppRunner(http_app)
@@ -1424,33 +1379,36 @@ async def main():
     await http_site.start()
 
     print("=" * 60)
-    print(f"  Jetson Violence Detection Client  [v7 — MANUAL RESET BUTTON]")
-    print(f"  Camera index   : {cam.camera_id}")
-    print(f"  Stream URL     : {WS_STREAM_URL}")
-    print(f"  Detection URL  : {WS_DETECTION_URL}")
+    print("  Jetson Violence Detection Client — MobileNetV2-TSM  [v5 — MANUAL RESET BUTTON]")
+    print(f"  Camera index       : {cam.camera_id}")
+    print(f"  Stream URL         : {WS_STREAM_URL}")
+    print(f"  Detection URL      : {WS_DETECTION_URL}")
+    print(f"  Stream FPS         : {STREAM_FPS}")
+    print(f"  Num frames         : {NUM_FRAMES} (sliding window)")
+    print(f"  Input size         : {INPUT_SIZE}x{INPUT_SIZE}")
+    print(f"  Conf thresh        : {CONF_THRESH}")
+    print(f"  Alert window       : {ALERT_SECONDS}s")
     print(f"  ── Video Analysis HTTP Server ─────────────")
-    print(f"  Listen         : http://{JETSON_HTTP_HOST}:{JETSON_HTTP_PORT}")
-    print(f"  POST           : /analyze-video  (multipart, field: 'video')")
-    print(f"  GET            : /status")
-    print(f"  POST           : /cancel")
-    print(f"  WS result      : ws://BACKEND/ws/video-analysis/{{job_id}}")
-    print(f"  Max upload     : {MAX_VIDEO_SIZE_MB}MB")
-    print(f"  ── Inference ──────────────────────────────")
-    print(f"  INPUT_SIZE     : {INPUT_SIZE}px  (A0/A1=172, A2=224)")
-    print(f"  EMA alpha ↑↓   : {EMA_ALPHA_UP} / {EMA_ALPHA_DOWN}  (asymmetric, Cấp 1)")
-    print(f"  Spike boost    : x{SPIKE_BOOST} khi delta>{SPIKE_THRESH}")
-    print(f"  Threshold ON   : {THRESHOLD_ON}  (bật bạo lực, Cấp 3)")
-    print(f"  Threshold OFF  : {THRESHOLD_OFF}  (tắt bạo lực, Cấp 3)")
-    print(f"  Confirm frames : {CONFIRM_FRAMES}  cooldown {COOLDOWN_SEC}s")
-    print(f"  Normal→reset   : {NORMAL_FRAMES_TO_RESET} frames liên tiếp (Cấp 2)")
+    print(f"  Listen             : http://{JETSON_HTTP_HOST}:{JETSON_HTTP_PORT}")
+    print(f"  POST               : /analyze-video  (multipart, field: 'video')")
+    print(f"  GET                : /status")
+    print(f"  POST               : /cancel")
+    print(f"  WS result          : ws://BACKEND/ws/video-analysis/{{job_id}}")
+    print(f"  Max upload         : {MAX_VIDEO_SIZE_MB}MB")
     print(f"  ── Buzzer ─────────────────────────────────")
-    print(f"  GPIO PIN       : {BUZZER_PIN}  delay {VIOLENCE_BUZZER_DELAY}s")
+    print(f"  GPIO PIN           : {BUZZER_PIN}  (BOARD)")
+    print(f"  Kích hoạt sau      : {VIOLENCE_BUZZER_DELAY}s bạo lực liên tục")
+    print(f"  Beep ON / OFF      : {BUZZER_BEEP_ON_SEC}s / {BUZZER_BEEP_OFF_SEC}s")
+    print(f"  GPIO khả dụng      : {GPIO_AVAILABLE}")
     print(f"  ── Nút Bấm (Manual Reset) ─────────────────")
-    print(f"  BUTTON PIN     : {BUTTON_PIN}  (BOARD mode, cạnh GND Pin 14)")
-    print(f"  Tác dụng       : Tắt còi + Hủy gọi + Reset AI + Mù 5s")
+    print(f"  BUTTON PIN         : {BUTTON_PIN}  (BOARD mode, cạnh GND Pin 14)")
+    print(f"  Tác dụng           : Tắt còi + Hủy gọi + Clear Buffer + Mù 5s")
     print(f"  ── Phone ──────────────────────────────────")
-    print(f"  Số            : {PHONE_NUMBER}  port {PHONE_SERIAL_PORT}")
-    print(f"  SIM available  : {dialer.available}")
+    print(f"  Số điện thoại      : {PHONE_NUMBER}")
+    print(f"  Serial port        : {PHONE_SERIAL_PORT}  @ {PHONE_BAUD_RATE} baud")
+    print(f"  SIM khả dụng       : {dialer.available}")
+    print(f"  Thời gian gọi      : {PHONE_CALL_TIMEOUT}s rồi tự cúp")
+    print(f"  Cooldown gọi lại   : {PHONE_RETRY_DELAY}s")
     print("=" * 60)
 
     try:
