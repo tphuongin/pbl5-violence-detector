@@ -1,4 +1,6 @@
 import { useNavigate, useLocation } from 'react-router-dom';
+import { ShieldAlert, LogOut } from 'lucide-react';
+import { apiService } from '../services/apiService';
 
 function Header() {
   const navigate = useNavigate();
@@ -7,26 +9,43 @@ function Header() {
   const handleCameraClick = () => {
     navigate('/camera');
   };
-  const handleNotificationHistoryClick = () => {
-    navigate('/notification-history');
-  };
   const handleDetectionHistoryClick = () => {
     navigate('/detection-history');
+  };
+  const handleVideoAnalysisClick = () => {
+    navigate('/video-analysis');
   };
 
   const handleLogoClick = () => {
     navigate('/');
   };
 
+  const handleLogout = async () => {
+    try {
+      await apiService.logout();
+    } catch (err) {
+      console.error('Logout error:', err);
+    }
+    navigate('/login');
+  };
+
+
   const isCameraActive = location.pathname === '/camera';
-  const isNotificationHistoryActive = location.pathname === '/notification-history';
   const isDetectionHistoryActive = location.pathname === '/detection-history';
+  const isVideoAnalysisActive = location.pathname === '/video-analysis';
 
   return (
     <header className="topbar">
       <div className="topbar-inner">
-        <div className="brand" onClick={handleLogoClick} style={{ cursor: 'pointer' }}>
-          ABC
+        <div 
+          className="brand" 
+          onClick={handleLogoClick} 
+          role="button" 
+          tabIndex={0} 
+          style={{ cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '8px' }}
+        >
+          <ShieldAlert size={22} style={{ color: 'var(--primary)' }} />
+          <span>Violence Detector System</span>
         </div>
 
         <div className="topbar-actions">
@@ -38,11 +57,11 @@ function Header() {
             Camera
           </button>
           <button
-            className={`nav-link ${isNotificationHistoryActive ? 'active' : ''}`}   
+            className={`nav-link ${isVideoAnalysisActive ? 'active' : ''}`}
             type="button"
-            onClick={handleNotificationHistoryClick}
+            onClick={handleVideoAnalysisClick}
           >
-            Lịch sử thông báo
+            Phân tích video
           </button>
           <button
             className={`nav-link ${isDetectionHistoryActive ? 'active' : ''}`}
@@ -51,8 +70,14 @@ function Header() {
           >
             Lịch sử phát hiện
           </button>
-          <button className="logout-btn" type="button">
-            Đăng xuất
+          <button 
+            className="logout-btn" 
+            type="button"
+            onClick={handleLogout}
+            style={{ display: 'flex', alignItems: 'center', gap: '6px' }}
+          >
+            <LogOut size={16} />
+            <span>Đăng xuất</span>
           </button>
         </div>
       </div>

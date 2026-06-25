@@ -43,9 +43,34 @@ def get_db():
 
 
 def init_db():
-    
     Base.metadata.create_all(bind=engine)
     print("Database tables created successfully")
+    
+    # Auto-seed admin user if none exist
+    from sqlalchemy.orm import sessionmaker
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    db = SessionLocal()
+    try:
+        from models import User
+        import hashlib
+        import uuid
+        
+        if db.query(User).count() == 0:
+            print("No users found. Seeding default admin account...")
+            admin_user = User(
+                UserID=str(uuid.uuid4()),
+                Username="admin",
+                PasswordHash=hashlib.sha256("admin123".encode()).hexdigest()
+            )
+            db.add(admin_user)
+            db.commit()
+            print("✓ Default admin user seeded successfully (admin / admin123)")
+    except Exception as e:
+        print(f"Error seeding admin user: {e}")
+        db.rollback()
+    finally:
+        db.close()
+
 
 
 def drop_db():

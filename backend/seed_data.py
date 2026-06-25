@@ -46,113 +46,27 @@ def seed_data():
         db.commit()
         print(f"✓ Added {len(users)} users")
         
+        # Lưu UserID để sử dụng cho cameras
+        user_ids = [user.UserID for user in users]
+        
         print("\n--- Seeding Cameras ---")
         cameras = [
             Camera(
-                CameraID=str(uuid.uuid4()),
+                CameraID="jetson-cam-01",
                 CameraName="Camera Main Hall",
-                CameraIP="192.168.1.10",
+                CameraIP="192.168.137.2",
                 CameraPhoneNum="0901234567",
-                CameraStatus=True
-            ),
-            Camera(
-                CameraID=str(uuid.uuid4()),
-                CameraName="Camera Lobby",
-                CameraIP="192.168.1.11",
-                CameraPhoneNum="0901234568",
-                CameraStatus=True
-            ),
-            Camera(
-                CameraID=str(uuid.uuid4()),
-                CameraName="Camera Parking",
-                CameraIP="192.168.1.12",
-                CameraPhoneNum="0901234569",
-                CameraStatus=False
-            ),
-            Camera(
-                CameraID=str(uuid.uuid4()),
-                CameraName="Camera Entrance",
-                CameraIP="192.168.1.13",
-                CameraPhoneNum="0901234570",
-                CameraStatus=True
+                CameraStatus=True,
+                UserID=user_ids[0]
             )
         ]
         db.add_all(cameras)
         db.commit()
         print(f"✓ Added {len(cameras)} cameras")
         
-        print("\n--- Seeding Calls ---")
-        now = datetime.now()
-        calls = [
-            Call(
-                CallID=str(uuid.uuid4()),
-                CallDate=now - timedelta(days=2, hours=5)
-            ),
-            Call(
-                CallID=str(uuid.uuid4()),
-                CallDate=now - timedelta(days=1, hours=3, minutes=30)
-            ),
-            Call(
-                CallID=str(uuid.uuid4()),
-                CallDate=now - timedelta(hours=12)
-            ),
-            Call(
-                CallID=str(uuid.uuid4()),
-                CallDate=now - timedelta(hours=2)
-            )
-        ]
-        db.add_all(calls)
-        db.commit()
-        print(f"✓ Added {len(calls)} calls")
+        # Lưu CameraID để sử dụng cho calls và violence history
+        camera_ids = [camera.CameraID for camera in cameras]
         
-        print("\n--- Seeding Violence History ---")
-        violence_records = [
-            ViolenceHistory(
-                HistoryID=str(uuid.uuid4()),
-                Timestamp=now - timedelta(days=2, hours=5, minutes=15),
-                Location="Main Hall",
-                ClipURL="https://storage.example.com/clips/violence_001.mp4",
-                Confidence=0.92
-            ),
-            ViolenceHistory(
-                HistoryID=str(uuid.uuid4()),
-                Timestamp=now - timedelta(days=1, hours=3, minutes=45),
-                Location="Lobby",
-                ClipURL="https://storage.example.com/clips/violence_002.mp4",
-                Confidence=0.87
-            ),
-            ViolenceHistory(
-                HistoryID=str(uuid.uuid4()),
-                Timestamp=now - timedelta(hours=12, minutes=20),
-                Location="Entrance",
-                ClipURL="https://storage.example.com/clips/violence_003.mp4",
-                Confidence=0.95
-            ),
-            ViolenceHistory(
-                HistoryID=str(uuid.uuid4()),
-                Timestamp=now - timedelta(hours=2, minutes=5),
-                Location="Parking",
-                ClipURL="https://storage.example.com/clips/violence_004.mp4",
-                Confidence=0.78
-            ),
-            ViolenceHistory(
-                HistoryID=str(uuid.uuid4()),
-                Timestamp=now - timedelta(hours=1),
-                Location="Main Hall",
-                ClipURL="https://storage.example.com/clips/violence_005.mp4",
-                Confidence=0.88
-            )
-        ]
-        db.add_all(violence_records)
-        db.commit()
-        print(f"✓ Added {len(violence_records)} violence records")
-        
-        print("\n✓✓✓ Seed data completed successfully! ✓✓✓\n")
-        print("Summary:")
-        print(f"  - Users: {len(users)}")
-        print(f"  - Cameras: {len(cameras)}")
-        print(f"  - Calls: {len(calls)}")
-        print(f"  - Violence History: {len(violence_records)}")
         
     except Exception as e:
         print(f"\n✗ Error during seeding: {e}")

@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { apiService } from '../services/apiService';
+import { Video, AlertTriangle, PhoneCall, Users } from 'lucide-react';
 
 function HomePage() {
   const [stats, setStats] = useState({
@@ -23,6 +24,8 @@ function HomePage() {
         apiService.getUsers(),
       ]);
 
+      console.log('Fetched data:', { camerasData, violenceData, callsData, usersData });
+
       setStats({
         cameras: camerasData.count || 0,
         violenceRecords: violenceData.count || 0,
@@ -38,74 +41,40 @@ function HomePage() {
 
   return (
     <main className="page-shell">
+      <div className="page-banner">
+        <h1>Hệ thống Giám sát & Phát hiện Bạo lực Realtime</h1>
+        <p>Giải pháp AI tiên tiến giúp phát hiện hành vi bạo lực qua camera giám sát và tự động phát cảnh báo cuộc gọi tức thời.</p>
+      </div>
+
       <section className="intro-section">
-        {!loading && (
-          <div
-            style={{
-              display: 'grid',
-              gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))',
-              gap: '15px',
-              marginTop: '30px',
-            }}
-          >
-            <div
-              style={{
-                backgroundColor: '#e3f2fd',
-                padding: '20px',
-                borderRadius: '8px',
-                textAlign: 'center',
-                border: '2px solid #2196f3',
-              }}
-            >
-              <div style={{ fontSize: '2em', fontWeight: 'bold', color: '#2196f3' }}>
-                {stats.cameras}
-              </div>
-              <div style={{ color: '#666', marginTop: '8px' }}>Camera</div>
+        {loading ? (
+          <div style={{ textAlign: 'center', padding: '40px 0', color: 'var(--muted)', fontWeight: '600' }}>
+            Đang tải dữ liệu thống kê...
+          </div>
+        ) : (
+          <div className="stats-grid">
+            <div className="stat-card cameras">
+              <Video size={36} style={{ color: '#2563eb', marginBottom: '12px' }} />
+              <div className="stat-number">{stats.cameras}</div>
+              <div className="stat-label">Camera Kết Nối</div>
             </div>
 
-            <div
-              style={{
-                backgroundColor: '#fff3e0',
-                padding: '20px',
-                borderRadius: '8px',
-                textAlign: 'center',
-                border: '2px solid #ff9800',
-              }}
-            >
-              <div style={{ fontSize: '2em', fontWeight: 'bold', color: '#ff9800' }}>
-                {stats.violenceRecords}
-              </div>
-              <div style={{ color: '#666', marginTop: '8px' }}>Phát hiện bạo lực</div>
+            <div className="stat-card violence">
+              <AlertTriangle size={36} style={{ color: '#d97706', marginBottom: '12px' }} />
+              <div className="stat-number">{stats.violenceRecords}</div>
+              <div className="stat-label">Cảnh Báo Bạo Lực</div>
             </div>
 
-            <div
-              style={{
-                backgroundColor: '#f3e5f5',
-                padding: '20px',
-                borderRadius: '8px',
-                textAlign: 'center',
-                border: '2px solid #9c27b0',
-              }}
-            >
-              <div style={{ fontSize: '2em', fontWeight: 'bold', color: '#9c27b0' }}>
-                {stats.calls}
-              </div>
-              <div style={{ color: '#666', marginTop: '8px' }}>Cuộc gọi</div>
+            <div className="stat-card calls">
+              <PhoneCall size={36} style={{ color: '#7c3aed', marginBottom: '12px' }} />
+              <div className="stat-number">{stats.calls}</div>
+              <div className="stat-label">Cuộc Gọi Đã Gửi</div>
             </div>
 
-            <div
-              style={{
-                backgroundColor: '#e8f5e9',
-                padding: '20px',
-                borderRadius: '8px',
-                textAlign: 'center',
-                border: '2px solid #4caf50',
-              }}
-            >
-              <div style={{ fontSize: '2em', fontWeight: 'bold', color: '#4caf50' }}>
-                {stats.users}
-              </div>
-              <div style={{ color: '#666', marginTop: '8px' }}>Người dùng</div>
+            <div className="stat-card users">
+              <Users size={36} style={{ color: '#059669', marginBottom: '12px' }} />
+              <div className="stat-number">{stats.users}</div>
+              <div className="stat-label">Người Dùng</div>
             </div>
           </div>
         )}
